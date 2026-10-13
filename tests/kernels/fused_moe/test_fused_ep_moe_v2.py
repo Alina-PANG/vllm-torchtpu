@@ -979,6 +979,39 @@ def test_fp4_block512_tracks_dense_reference_and_routing_plan():
     assert _relative_l2(out, wrong) > ROTATED_CONTROL_FACTOR * error
 
 
+@pytest.mark.parametrize(
+    "w1_minor,w2_minor", [(True, False), (False, True), (True, True)]
+)
+def test_fp4_expert_second_minor_scale_reads_are_bit_exact(w1_minor, w2_minor):
+    """Reading either scale table expert-second-minor changes only its
+    addressing."""
+    mesh = _mesh()
+    weights, scales, _ = _make_fp4_weights(
+        mesh, 44, hidden=2048, inter=1024, e_total=32, rhs_qb=512
+    )
+    x, gating = _make_inputs(mesh, 45, tokens=256, hidden=2048, e_total=32)
+    common = dict(
+        topk=4,
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=512,
+        sharded_plan=True,
+    )
+    default_layout = fused_ep_moe_v2(x, *weights, *scales, gating, **common)
+    second_minor = fused_ep_moe_v2(
+        x,
+        *weights,
+        *scales,
+        gating,
+        w1_scales_expert_second_minor=w1_minor,
+        w2_scales_expert_second_minor=w2_minor,
+        **common,
+    )
+    np.testing.assert_array_equal(np.asarray(second_minor), np.asarray(default_layout))
+
+
 # --------------------------------------------------------------------------- #
 # The weight-DMA schedule.
 #
