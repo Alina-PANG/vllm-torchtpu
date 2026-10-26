@@ -30,7 +30,7 @@ Numeric contract (`DECODE` vs `MIXED`):
     compressed pages back, so `q_len == 1` decode and `q_len > 1` verify differ by
     quantization noise on the newest token.
 
-Tensor-parallel `shard_map` partitioning:
+Tensor-parallel `shard_map` integration (`layers/adapter/turboquant_attention.py`):
   Partition `queries`/`keys`/`values` on axis 1, `packed_new_kv` on axis 2, 4D
   `kv_cache` on axis 1 (5D `kv_cache_bundle` on axis 2), and replicate `kv_lens`,
   `page_indices`, `cu_q_lens`, `distribution`, and `layer_idx`.
