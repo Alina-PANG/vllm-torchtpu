@@ -1026,10 +1026,10 @@ TENSORCORE_TABLES_MAX_SC_SUBCORES = 4
 def slab_tables_on_tensorcore(info=None):
     """Whether this chip builds the slab tables on the TensorCore.
 
-    True selects the TensorCore builds (today a scatter-set for both slab
-    tables); False keeps both tables scatter-adds for the SparseCore. Read off
-    the same device record the VMEM accounting reads, so the layer answers it
-    once per build.
+    True selects the TensorCore builds (the scale-slab lookup, and a
+    scatter-set for any scatter left); False keeps both tables scatter-adds
+    for the SparseCore. Read off the same device record the VMEM accounting
+    reads, so the layer answers it once per build.
     """
     if info is None:
         info = pltpu.get_tpu_info()
