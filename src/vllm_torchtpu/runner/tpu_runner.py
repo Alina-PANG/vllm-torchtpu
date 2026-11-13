@@ -949,6 +949,9 @@ class TPUModelRunner(GPUModelRunner):
         # Whether another DP rank ran a decode this step; SrptPrefillScheduler
         # applies VLLM_TPU_SRPT_ATTN_WORK_CAP only while some rank decodes.
         self._dp_step_other_decode = False
+        # Whether any DP rank's step carries a prefill span; the MTP draft's
+        # two-pass step 0 decides on it DP-wide (Eagle3Proposer).
+        self._dp_step_any_prefill = False
         self.check_recompilation = vllm_envs.VLLM_XLA_CHECK_RECOMPILATION
         self.use_spmd = vllm_envs.VLLM_XLA_USE_SPMD
 
@@ -4111,6 +4114,7 @@ class TPUModelRunner(GPUModelRunner):
         local_num_reqs: int = 0,
         has_encoder_inputs: bool = False,
         local_any_decode: bool = False,
+        local_any_prefill: bool = False,
     ) -> "tuple[int | None, int]":
         """Return the DP-wide padded token bucket and forward chunk count."""
         self._dp_step_other_decode = False
@@ -4134,6 +4138,7 @@ class TPUModelRunner(GPUModelRunner):
                 # tell under a MAX reduction whether another one decodes.
                 int(local_any_decode) * (dp_rank + 1),
                 int(local_any_decode) * (dp_size - dp_rank),
+                int(local_any_prefill),
             ],
             dtype=torch.int64,
             device="cpu",
@@ -4152,6 +4157,7 @@ class TPUModelRunner(GPUModelRunner):
         self._dp_step_other_decode = highest >= 0 and (
             highest != lowest or highest != dp_rank
         )
+        self._dp_step_any_prefill = bool(t[6].item())
         return bucket, int(t[1].item())
 
     def _any_decode(self, scheduler_output: "SchedulerOutput") -> bool:
@@ -4168,6 +4174,19 @@ class TPUModelRunner(GPUModelRunner):
                 batch.num_computed_tokens_cpu[indices]
                 >= batch.num_prompt_tokens[indices]
             ).any()
+        )
+
+    def _any_draft_prefill(self, scheduler_output: "SchedulerOutput") -> bool:
+        """Whether this step schedules a prefill span; computed only for the
+        MTP draft's two-pass step 0, which reads it DP-wide under EP-DP
+        lockstep."""
+        if not self._dp_lockstep_enabled():
+            return False
+        drafter = self.drafter
+        return isinstance(drafter, Eagle3Proposer) and (
+            drafter.schedules_kv_only_prefill(
+                scheduler_output.num_scheduled_tokens.values()
+            )
         )
 
     def _execute_dp_mm_encoder(
@@ -4316,6 +4335,7 @@ class TPUModelRunner(GPUModelRunner):
             local_num_reqs=local_max_chunk_reqs,
             has_encoder_inputs=bool(scheduler_output.scheduled_encoder_inputs),
             local_any_decode=self._any_decode(scheduler_output),
+            local_any_prefill=self._any_draft_prefill(scheduler_output),
         )
         self._dp_step_num_chunks = target_num_chunks
         readmitted = self._readmit_trimmed_drafts(
