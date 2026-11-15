@@ -213,6 +213,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
     VLLM_TPU_SRPT_ATTN_WORK_CAP: int = 0
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
+    VLLM_TPU_OMNI_TEXT_ENCODER_OFFLOAD: bool = False
 
 
 def env_with_choices(
@@ -1300,6 +1301,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tile).
     "VLLM_TPU_SRPT_ATTN_TILE_TOKENS": env_nonnegative_int(
         "VLLM_TPU_SRPT_ATTN_TILE_TOKENS", 32
+    ),
+    # vLLM-Omni: offload QwenImagePipeline.text_encoder to CPU after
+    # encode_prompt completes (and restore before subsequent encode_prompt
+    # calls) to free HBM for VAE decode under tight memory budgets.
+    "VLLM_TPU_OMNI_TEXT_ENCODER_OFFLOAD": env_bool(
+        "VLLM_TPU_OMNI_TEXT_ENCODER_OFFLOAD", False
     ),
 }
 
