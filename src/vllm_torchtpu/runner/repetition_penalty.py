@@ -24,10 +24,10 @@ seen-token bitmask per request id (``RepetitionPenaltyTracker``).
 For each penalized request, ``SeenTokenBitmask`` packs presence bits over
 vocabulary ids ``[0, vocab_size)`` from ``prompt_token_ids`` and the output ids
 into ``cdiv(vocab_size, 32)`` ``int32`` words (out-of-range ids such as
-multimodal placeholders or text tokens wider than a codec head are ignored). On
-device, the bitmask is unpacked and seen positions are scaled in ``float32`` by
-``1 / penalty`` where ``logits > 0`` and ``penalty`` otherwise before casting
-back to ``logits.dtype``.
+multimodal placeholders are ignored). On device, the bitmask is unpacked and
+seen positions are scaled in ``float32`` by ``1 / penalty`` where
+``logits > 0`` and ``penalty`` otherwise before casting back to
+``logits.dtype``.
 """
 
 from __future__ import annotations
@@ -53,18 +53,16 @@ class SeenTokenBitmask:
     """Packed presence bits of one request's prompt and output ids, updated
     incrementally as the output grows."""
 
-    def __init__(self) -> None:
-        self._vocab_size = 0
-        self._bitmask: np.ndarray | None = None
+    def __init__(self, vocab_size: int) -> None:
+        self._vocab_size = vocab_size
+        self._bitmask = np.zeros((num_bitmask_words(vocab_size),), dtype=np.int32)
         self._prompt_ids: Sequence[int] | None = None
         self._output_ids: Sequence[int] | None = None
         self._committed_len = 0
+        self._built = False
 
     def update(
-        self,
-        prompt_ids: Sequence[int] | None,
-        output_ids: Sequence[int],
-        vocab_size: int,
+        self, prompt_ids: Sequence[int] | None, output_ids: Sequence[int]
     ) -> np.ndarray:
         """Return the ``int32`` ``[cdiv(vocab_size, 32)]`` presence bitmask over
         ``prompt_ids`` and ``output_ids``.
@@ -73,24 +71,20 @@ class SeenTokenBitmask:
         a different object (a streaming-input continuation, or a finished id
         sent again) or the output became shorter.
         """
-        num_words = num_bitmask_words(vocab_size)
+        vocab_size = self._vocab_size
         cur_len = len(output_ids)
         if (
-            self._bitmask is None
-            or self._vocab_size != vocab_size
+            not self._built
             or prompt_ids is not self._prompt_ids
             or output_ids is not self._output_ids
             or cur_len < self._committed_len
         ):
-            if self._bitmask is None or self._bitmask.shape[0] != num_words:
-                self._bitmask = np.zeros((num_words,), dtype=np.int32)
-            else:
-                self._bitmask.fill(0)
+            self._bitmask.fill(0)
             if prompt_ids is not None and len(prompt_ids) > 0:
                 prompt = np.asarray(prompt_ids, dtype=np.int64)
                 valid = prompt[(prompt >= 0) & (prompt < vocab_size)]
                 np.bitwise_or.at(self._bitmask, valid >> 5, _BIT_MASKS[valid & 31])
-            self._vocab_size = vocab_size
+            self._built = True
             self._prompt_ids = prompt_ids
             self._output_ids = output_ids
             self._committed_len = 0
@@ -107,12 +101,16 @@ class SeenTokenBitmask:
 
 class RepetitionPenaltyTracker:
     """Seen-token bitmasks, by request id, of the requests that
-    ``InputBatch.repetition_penalties_reqs`` lists."""
+    ``InputBatch.repetition_penalties_reqs`` lists, and the host staging
+    buffers for one logits chunk of at most ``max_num_reqs`` rows."""
 
-    def __init__(self) -> None:
+    def __init__(self, vocab_size: int, max_num_reqs: int) -> None:
+        self.vocab_size = vocab_size
         self._seen: dict[str, SeenTokenBitmask] = {}
-        self._bitmask_buf: np.ndarray | None = None
-        self._penalties_buf: np.ndarray | None = None
+        self._bitmask_buf = np.zeros(
+            (max_num_reqs, num_bitmask_words(vocab_size)), dtype=np.int32
+        )
+        self._penalties_buf = np.ones((max_num_reqs, 1), dtype=np.float32)
         self._dirty_rows: list[int] = []
 
     def prune(self, req_ids: Collection[str]) -> None:
@@ -128,7 +126,6 @@ class RepetitionPenaltyTracker:
         start: int,
         end: int,
         num_rows: int,
-        vocab_size: int,
     ) -> tuple[np.ndarray, np.ndarray] | None:
         """Stage ``(seen_bitmask, penalties)`` for the plain 1-row/req logits
         chunk of batch rows ``[start, end)`` into reusable host buffers, or
@@ -139,41 +136,28 @@ class RepetitionPenaltyTracker:
             for req_id in input_batch.repetition_penalties_reqs
             if start <= (index := req_id_to_index[req_id]) < end
         ]
-        if not indices or vocab_size <= 0:
+        if not indices:
             return None
-        num_words = num_bitmask_words(vocab_size)
-        if (
-            self._bitmask_buf is None
-            or self._penalties_buf is None
-            or self._bitmask_buf.shape[0] < num_rows
-            or self._bitmask_buf.shape[1] != num_words
-        ):
-            self._bitmask_buf = np.zeros((num_rows, num_words), dtype=np.int32)
-            self._penalties_buf = np.ones((num_rows, 1), dtype=np.float32)
-            self._dirty_rows.clear()
-        else:
-            for prev_row in self._dirty_rows:
-                self._bitmask_buf[prev_row].fill(0)
-                self._penalties_buf[prev_row, 0] = 1.0
-            self._dirty_rows.clear()
+        for prev_row in self._dirty_rows:
+            self._bitmask_buf[prev_row].fill(0)
+            self._penalties_buf[prev_row, 0] = 1.0
+        self._dirty_rows.clear()
 
         for batch_idx in indices:
             row = batch_idx - start
             req_id = input_batch.req_ids[batch_idx]
             seen = self._seen.get(req_id)
             if seen is None:
-                seen = self._seen[req_id] = SeenTokenBitmask()
+                seen = self._seen[req_id] = SeenTokenBitmask(self.vocab_size)
             output_ids = input_batch.req_output_token_ids[batch_idx]
             assert req_id is not None and output_ids is not None
             self._bitmask_buf[row] = seen.update(
-                requests[req_id].prompt_token_ids, output_ids, vocab_size
+                requests[req_id].prompt_token_ids, output_ids
             )
             self._penalties_buf[row, 0] = input_batch.repetition_penalties_cpu[
                 batch_idx
             ]
             self._dirty_rows.append(row)
-        if self._bitmask_buf.shape[0] == num_rows:
-            return self._bitmask_buf, self._penalties_buf
         return self._bitmask_buf[:num_rows], self._penalties_buf[:num_rows]
 
 

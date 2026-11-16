@@ -71,54 +71,54 @@ def _batch(rows: dict[str, tuple[float, list[int]]], order: list[str]):
 
 class TestSeenTokenBitmask:
     def test_incremental_update_rollback_and_out_of_range_ids(self):
-        seen = rep_pen.SeenTokenBitmask()
+        seen = rep_pen.SeenTokenBitmask(vocab_size=64)
         # Includes -1 (MM placeholder), 31 (sign bit of word 0), and 151645 (OOB).
         prompt = [-1, 2, 5, 31, 151645]
         output: list[int] = []
 
         # Prefill: only in-range prompt ids [2, 5, 31] marked.
-        m0 = seen.update(prompt, output, vocab_size=64)
+        m0 = seen.update(prompt, output)
         assert _unpack_bits(m0, 64) == [2, 5, 31]
 
         # Incremental decode update (+ out-of-range ignored + bit 63 sign bit).
         output += [6, 63, 999]
-        m1 = seen.update(prompt, output, vocab_size=64)
+        m1 = seen.update(prompt, output)
         assert _unpack_bits(m1, 64) == [2, 5, 6, 31, 63]
 
         # Additional output tokens update in place without reallocating.
         output += [1] * 10
-        m2 = seen.update(prompt, output, vocab_size=64)
+        m2 = seen.update(prompt, output)
         assert m2 is m1
         assert _unpack_bits(m2, 64) == [1, 2, 5, 6, 31, 63]
 
         # Shrunk output (rollback) zeroes and rebuilds in place from prompt + output.
         del output[1:]
-        m3 = seen.update(prompt, output, vocab_size=64)
+        m3 = seen.update(prompt, output)
         assert m3 is m1
         assert _unpack_bits(m3, 64) == [2, 5, 6, 31]
 
     def test_new_prompt_or_output_list_rebuilds(self):
         """A streaming-input continuation, or a finished id sent again, gives
         the request new lists; the old bits must not leak into the new ones."""
-        seen = rep_pen.SeenTokenBitmask()
+        seen = rep_pen.SeenTokenBitmask(vocab_size=16)
         output = [7]
-        assert _unpack_bits(seen.update([2], output, 16), 16) == [2, 7]
+        assert _unpack_bits(seen.update([2], output), 16) == [2, 7]
         # Same output list, new prompt (streaming continuation keeps the list).
         output.clear()
-        assert _unpack_bits(seen.update([2, 9], output, 16), 16) == [2, 9]
+        assert _unpack_bits(seen.update([2, 9], output), 16) == [2, 9]
         # New output list object with the same length.
-        assert _unpack_bits(seen.update([2, 9], [], 16), 16) == [2, 9]
-        assert _unpack_bits(seen.update(None, [4], 16), 16) == [4]
+        assert _unpack_bits(seen.update([2, 9], []), 16) == [2, 9]
+        assert _unpack_bits(seen.update(None, [4]), 16) == [4]
 
     def test_numpy_prompt_ids(self):
-        seen = rep_pen.SeenTokenBitmask()
+        seen = rep_pen.SeenTokenBitmask(vocab_size=32)
         prompt = np.array([1, 3, 31], dtype=np.int32)
-        assert _unpack_bits(seen.update(prompt, [], 32), 32) == [1, 3, 31]
+        assert _unpack_bits(seen.update(prompt, []), 32) == [1, 3, 31]
 
 
 class TestTracker:
     def test_reads_rows_penalties_and_outputs_from_the_batch(self):
-        tracker = rep_pen.RepetitionPenaltyTracker()
+        tracker = rep_pen.RepetitionPenaltyTracker(vocab_size=64, max_num_reqs=8)
         requests = {
             "a": SimpleNamespace(prompt_token_ids=[1]),
             "b": SimpleNamespace(prompt_token_ids=[2]),
@@ -126,7 +126,7 @@ class TestTracker:
         rows = {"a": (1.1, [3]), "b": (1.0, [4])}
         # Row 0 ("b") has no penalty; row 1 ("a") does.
         inputs = tracker.build_plain_inputs(
-            _batch(rows, ["b", "a"]), requests, 0, 2, num_rows=4, vocab_size=64
+            _batch(rows, ["b", "a"]), requests, 0, 2, num_rows=4
         )
         assert inputs is not None
         bitmask, penalties = inputs
@@ -136,11 +136,12 @@ class TestTracker:
 
         # The next step moves "a" to row 0: row 1 is cleared in the reused buffer.
         inputs2 = tracker.build_plain_inputs(
-            _batch(rows, ["a", "b"]), requests, 0, 2, num_rows=4, vocab_size=64
+            _batch(rows, ["a", "b"]), requests, 0, 2, num_rows=4
         )
         assert inputs2 is not None
         bitmask2, penalties2 = inputs2
-        assert bitmask2 is bitmask and penalties2 is penalties
+        assert np.shares_memory(bitmask2, bitmask)
+        assert np.shares_memory(penalties2, penalties)
         assert _unpack_bits(bitmask2[0], 64) == [1, 3]
         assert _unpack_bits(bitmask2[1], 64) == []
         assert penalties2[:, 0].tolist() == pytest.approx([1.1, 1.0, 1.0, 1.0])
@@ -148,18 +149,16 @@ class TestTracker:
         # A chunk without a penalized row stages nothing.
         assert (
             tracker.build_plain_inputs(
-                _batch(rows, ["a", "b"]), requests, 1, 2, num_rows=4, vocab_size=64
+                _batch(rows, ["a", "b"]), requests, 1, 2, num_rows=4
             )
             is None
         )
 
     def test_prune_drops_requests_that_left_the_penalized_set(self):
-        tracker = rep_pen.RepetitionPenaltyTracker()
+        tracker = rep_pen.RepetitionPenaltyTracker(vocab_size=8, max_num_reqs=8)
         requests = {r: SimpleNamespace(prompt_token_ids=[1]) for r in "ab"}
         rows = {"a": (1.1, []), "b": (1.2, [])}
-        tracker.build_plain_inputs(
-            _batch(rows, ["a", "b"]), requests, 0, 2, num_rows=2, vocab_size=8
-        )
+        tracker.build_plain_inputs(_batch(rows, ["a", "b"]), requests, 0, 2, num_rows=2)
         assert sorted(tracker._seen) == ["a", "b"]
         tracker.prune({"b"})
         assert sorted(tracker._seen) == ["b"]
@@ -249,7 +248,9 @@ def _plain_runner(logits: torch.Tensor, async_scheduling: bool = False, spec=Non
         _pp_wave=None,
         _dp_step_other_decode=False,
         _min_tokens=min_tokens.MinTokensTracker(),
-        _repetition_penalty=rep_pen.RepetitionPenaltyTracker(),
+        _repetition_penalty=rep_pen.RepetitionPenaltyTracker(
+            vocab_size=logits.shape[1], max_num_reqs=8
+        ),
         speculative_config=spec,
         scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
         _is_async_drafter=False,
@@ -375,7 +376,9 @@ class TestRunnerIntegration:
         runner.speculative_config = None
         runner._greedy_head_owner = object()
         runner._min_tokens = min_tokens.MinTokensTracker()
-        runner._repetition_penalty = rep_pen.RepetitionPenaltyTracker()
+        runner._repetition_penalty = rep_pen.RepetitionPenaltyTracker(
+            vocab_size=16, max_num_reqs=4
+        )
 
         assert batch.repetition_penalties_reqs == {"a"}
         assert not runner._greedy_top_tokens_this_step()

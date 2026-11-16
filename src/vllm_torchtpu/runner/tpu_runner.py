@@ -1068,7 +1068,9 @@ class TPUModelRunner(GPUModelRunner):
         self.execute_model_state: ExecuteModelState | None = None
         self._pre_async_results: AsyncPreResults | None = None
         self._min_tokens = min_tokens_mask.MinTokensTracker()
-        self._repetition_penalty = repetition_penalty_ops.RepetitionPenaltyTracker()
+        self._repetition_penalty = repetition_penalty_ops.RepetitionPenaltyTracker(
+            self.vocab_size, self.max_num_reqs
+        )
         # 1 on TP rank 0, else 0; built lazily on first use by
         # _sync_replicated_drafts_across_tp (needs the TP group initialized).
         self._tp_rank0_mask: torch.Tensor | None = None
@@ -4988,12 +4990,7 @@ class TPUModelRunner(GPUModelRunner):
         self, logits: torch.Tensor, start: int, end: int
     ) -> torch.Tensor:
         inputs = self._repetition_penalty.build_plain_inputs(
-            self.input_batch,
-            self.requests,
-            start,
-            end,
-            logits.shape[0],
-            logits.shape[1],
+            self.input_batch, self.requests, start, end, logits.shape[0]
         )
         if inputs is None:
             return logits
