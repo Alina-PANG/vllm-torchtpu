@@ -21,6 +21,7 @@ pipeline. Each shape bucket gets its own compiled executable.
 import contextlib
 import copy
 import dataclasses
+import gc
 import glob
 import hashlib
 import importlib.util
@@ -954,6 +955,26 @@ class TpuCompilerAdaptor(CompilerInterface):
                 self._mark_failed(key, fingerprint)
             else:
                 self._clear_failed(key)
+
+        # Run the artifact just saved, not the in-process compile result: the
+        # latter keeps device tensors alive once it has run (about 0.68 GiB
+        # for Qwen3.8-Flash's largest bucket), which a runnable rebuilt from
+        # the artifact does not. That HBM would otherwise count against the
+        # KV budget measured after the profile run, so a rank that compiled
+        # the profile bucket sizes a smaller KV cache than one that replayed
+        # or loaded it -- across the ranks of one start under peer replay, and
+        # between a cold start and the warm start after it, whose different
+        # block counts then give the backbone a different compile-cache key.
+        # The rebuilt runnable is what replaying ranks and warm starts run.
+        if handle is not None:
+            reloaded = self._replay(handle[1], graph, was_wrapped, fingerprint)
+            if reloaded is not None:
+                del entry
+                compiled_fn = (
+                    self._unwrap_compiled_fn(reloaded) if was_wrapped else reloaded
+                )
+                # The in-process result holds reference cycles.
+                gc.collect()
 
         # Offer this bucket to later traces of the same model, so a graph that
         # refuses it reuses this runnable instead of building a second

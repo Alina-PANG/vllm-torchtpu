@@ -759,13 +759,74 @@ class TestTpuCompilerCache:
         fn, handle = compile(b)
 
         assert compiled == [0]
-        assert replayed == ["entry-from-rank-0"]
+        # Each compiling rank also reloads the artifact it saved.
+        assert replayed == ["entry-from-rank-0", "entry-from-rank-0"]
         assert fn() == "entry-from-rank-0"
         key, path, _ = handle
         assert path == os.path.join(b.cache_dir, key)
         assert os.path.samefile(path, os.path.join(a.cache_dir, key))
         assert sorted(os.listdir(tmp_path / "hash")) == ["rank_0_0", "rank_1_0"]
         assert os.listdir(b.cache_dir) == [key]
+
+    def test_a_compiled_bucket_runs_from_its_saved_artifact(
+        self, tmp_path, monkeypatch
+    ):
+        """The compiling rank runs the runnable rebuilt from the artifact it
+        saved, as replaying ranks and warm starts do, and drops the in-process
+        compile result, whose device tensors would otherwise count against
+        the KV budget."""
+        import weakref
+
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        (a,), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch, n=1, peer_replay="0"
+        )
+        built = []
+        real_backend = tpu_compiler._tpu_backend
+
+        def backend(graph, example_inputs):
+            result = real_backend(graph, example_inputs)
+            built.append(weakref.ref(result))
+            return result
+
+        monkeypatch.setattr(tpu_compiler, "_tpu_backend", backend)
+        fn, handle = compile(a)
+
+        assert compiled == [0]
+        assert replayed == ["entry-from-rank-0"]
+        assert fn() == "entry-from-rank-0"
+        assert handle is not None
+        assert built[0]() is None
+
+    def test_the_in_process_result_is_kept_when_the_reload_fails(
+        self, tmp_path, monkeypatch
+    ):
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+
+        (a,), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch, n=1, peer_replay="0"
+        )
+        monkeypatch.setattr(TpuCompilerAdaptor, "_replay", lambda *args, **kw: None)
+        fn, handle = compile(a)
+
+        assert compiled == [0]
+        assert fn() == 0
+        assert handle is not None
+
+    def test_nothing_is_reloaded_without_a_saved_artifact(self, tmp_path, monkeypatch):
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+
+        (a,), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch, n=1, peer_replay="0"
+        )
+        monkeypatch.setattr(TpuCompilerAdaptor, "_save_handle", lambda *a, **k: False)
+        fn, handle = compile(a)
+
+        assert compiled == [0]
+        assert replayed == []
+        assert fn() == 0
+        assert handle is None
 
     def test_a_peer_artifact_of_another_graph_is_not_replayed(
         self, tmp_path, monkeypatch
@@ -781,7 +842,8 @@ class TestTpuCompilerCache:
         compile(b, torch.fx.symbolic_trace(lambda x: x * 2 + 2))
 
         assert compiled == [0, 1]
-        assert replayed == []
+        # Each compiling rank also reloads the artifact it saved.
+        assert replayed == ["entry-from-rank-0", "entry-from-rank-1"]
         assert not os.path.samefile(
             os.path.join(a.cache_dir, "artifact_bucket"),
             os.path.join(b.cache_dir, "artifact_bucket"),
@@ -825,7 +887,8 @@ class TestTpuCompilerCache:
         with wait_for_peer_artifact(0.05):
             compile(b)
         assert compiled == [1]
-        assert replayed == []
+        # Each compiling rank also reloads the artifact it saved.
+        assert replayed == ["entry-from-rank-1"]
 
     def test_a_rank_stops_waiting_when_the_owner_cannot_save(
         self, tmp_path, monkeypatch
@@ -985,7 +1048,8 @@ class TestTpuCompilerCache:
             _, handle = compile(b)
 
         assert compiled == [0, 1]
-        assert replayed == []
+        # Each compiling rank also reloads the artifact it saved.
+        assert replayed == ["entry-from-rank-0", "entry-from-rank-1"]
         key, path, _ = handle
         assert not os.path.samefile(path, os.path.join(a.cache_dir, key))
         with open(path, "rb") as f:
@@ -1004,7 +1068,8 @@ class TestTpuCompilerCache:
         fn, handle = compile(b, _trace_all_reduce_graph("7"))
 
         assert compiled == [0]
-        assert replayed == ["entry-from-rank-0"]
+        # Each compiling rank also reloads the artifact it saved.
+        assert replayed == ["entry-from-rank-0", "entry-from-rank-0"]
         assert fn() == "entry-from-rank-0"
         key, path, _ = handle
         assert a.cache_dir is not None
