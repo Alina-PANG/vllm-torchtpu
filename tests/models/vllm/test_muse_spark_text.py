@@ -623,9 +623,9 @@ def test_real_loader_sequence_binds_op_after_quant_finalize(
     """Regression test for F014: load_weights does not call PWAL prematurely."""
     _use_cpu_platform(monkeypatch, request)
     register_models()
-    assert (
-        ModelRegistry.models["MuseSparkForConditionalGeneration"].load_model_cls()
-        is MuseSparkForConditionalGeneration
+    assert issubclass(
+        ModelRegistry.models["MuseSparkForConditionalGeneration"].load_model_cls(),
+        TPUMuseSparkForCausalLM,
     )
     assert MODELS_CONFIG_MAP["MuseSparkForConditionalGeneration"] is TPUMuseSparkConfig
 
