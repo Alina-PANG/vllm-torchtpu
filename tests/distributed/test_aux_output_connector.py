@@ -26,16 +26,25 @@ import torch
 from vllm.distributed.aux_output_connector.connector import (
     AuxOutputSchedulerConnector,
 )
-from vllm.forward_context import set_forward_context
 from vllm.platforms import current_platform
 
-from tests.layers.adapter import test_routed_experts_capturer as capture_tests
+from tests.layers.adapter.routed_experts_test_utils import (
+    BLOCK_SIZE,
+    NUM_LAYERS,
+    PADDING,
+    TOKEN_PADDINGS,
+    TOPK,
+    expert_ids,
+    make_capturer,
+    make_moe_model,
+    make_vllm_connector,
+    model_forward,
+    stage_rows_on_host,
+)
 from vllm_torchtpu.distributed import aux_output_connector
 from vllm_torchtpu.layers.adapter import routed_experts_capturer
 
-BLOCK_SIZE = capture_tests.BLOCK_SIZE
-ROW_SHAPE = (capture_tests.NUM_LAYERS, capture_tests.TOPK)
-PADDING = capture_tests.PADDING
+ROW_SHAPE = (NUM_LAYERS, TOPK)
 # A rejected draft's row; every known row is below it.
 REJECTED = PADDING - 1
 
@@ -43,27 +52,17 @@ REJECTED = PADDING - 1
 @pytest.fixture(autouse=True)
 def on_host(monkeypatch):
     monkeypatch.setattr(current_platform, "device_type", "cpu")
-    monkeypatch.setattr(
-        routed_experts_capturer, "_STAGE_ROWS_OP", capture_tests._stage_rows_on_host
-    )
-
-
-def _model_forward(model, ids):
-    """One forward of [bucket, layers, k] `ids` through the hooks on `model`."""
-    vllm_config = capture_tests._vllm_config()
-    with set_forward_context(None, vllm_config, num_tokens=ids.shape[0]):
-        for layer in model:
-            layer.capture_fn(ids[:, layer.layer_id])
+    monkeypatch.setattr(routed_experts_capturer, "_STAGE_ROWS_OP", stage_rows_on_host)
 
 
 def test_every_layer_writes_the_given_capturer(monkeypatch):
     """vLLM binds its own capturer first; `use_capturer` rebinds each layer."""
-    capturer = capture_tests._capturer()
-    model = capture_tests._moe_model()
-    capture_tests._vllm_connector(monkeypatch, capturer, model).close()
-    ids = capture_tests._ids(16)
+    capturer = make_capturer()
+    model = make_moe_model()
+    make_vllm_connector(monkeypatch, capturer, model).close()
+    ids = expert_ids(16)
 
-    _model_forward(model, ids)
+    model_forward(model, ids)
 
     assert torch.equal(capturer.device_buffer[:16], ids)
 
@@ -71,11 +70,11 @@ def test_every_layer_writes_the_given_capturer(monkeypatch):
 @pytest.mark.parametrize("other", ["dtype", "shape"])
 def test_a_capturer_of_other_rows_is_refused(monkeypatch, other):
     """vLLM sized the connector's rows from the capturer it built."""
-    capturer = capture_tests._capturer(num_experts=256 if other == "dtype" else 512)
+    capturer = make_capturer(num_experts=256 if other == "dtype" else 512)
     if other == "shape":
         capturer.shape_per_token = (ROW_SHAPE[0], ROW_SHAPE[1] + 1)
-    model = capture_tests._moe_model()
-    connector = capture_tests._vllm_connector(monkeypatch, None, model)
+    model = make_moe_model()
+    connector = make_vllm_connector(monkeypatch, None, model)
     try:
         with pytest.raises(ValueError, match="differ"):
             aux_output_connector.use_capturer(connector, model, capturer)
@@ -162,9 +161,9 @@ def _serve(monkeypatch, seed, num_spec, flaw=None):
     padding, "vllm_capturer" keeps vLLM's own capturer.
     """
     rng = random.Random(seed)
-    capturer = capture_tests._capturer()
-    model = capture_tests._moe_model()
-    connector = capture_tests._vllm_connector(
+    capturer = make_capturer()
+    model = make_moe_model()
+    connector = make_vllm_connector(
         monkeypatch, None if flaw == "vllm_capturer" else capturer, model
     )
     cached = set()
@@ -255,7 +254,7 @@ def _serve(monkeypatch, seed, num_spec, flaw=None):
     def forward(rids, num_new, drafts, sampled):
         """One forward padded to a bucket; drafts are accepted at random."""
         num_rows = sum(num_new[r] for r in rids)
-        bucket = next(b for b in capture_tests.TOKEN_PADDINGS if b >= num_rows)
+        bucket = next(b for b in TOKEN_PADDINGS if b >= num_rows)
         ids = np.full((bucket, *ROW_SHAPE), PADDING, dtype=np.int32)
         row = 0
         for rid in rids:
@@ -269,7 +268,7 @@ def _serve(monkeypatch, seed, num_spec, flaw=None):
             first = start + 1 if k else end
             produces = end >= req.num_prompt_tokens
             sampled[rid] = [req.token(p) for p in range(first, end + 1) if produces]
-        _model_forward(model, torch.from_numpy(ids))
+        model_forward(model, torch.from_numpy(ids))
         return bucket, num_rows
 
     try:

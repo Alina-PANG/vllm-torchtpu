@@ -37,12 +37,12 @@ def use_capturer(
     # AuxOutputWorkerConnector cannot be given a capturer, so replace the one
     # it built. It reads `_capturer` only to size its rows and take snapshots.
     built = connector._capturer
-    rows = (capturer.shape_per_token, capturer.output_dtype_name)
-    built_rows = (built.shape_per_token, built.output_dtype_name)
-    if rows != built_rows:
+    row_format = (capturer.shape_per_token, capturer.output_dtype_name)
+    built_row_format = (built.shape_per_token, built.output_dtype_name)
+    if row_format != built_row_format:
         raise ValueError(
-            f"capturer rows {rows} differ from the {built_rows} vLLM's "
-            "connector was sized for"
+            f"capturer row format {row_format} differs from the "
+            f"{built_row_format} vLLM's connector was sized for"
         )
     connector._capturer = capturer
     # Rebinds every layer vLLM bound, so no hook keeps vLLM's capturer and its

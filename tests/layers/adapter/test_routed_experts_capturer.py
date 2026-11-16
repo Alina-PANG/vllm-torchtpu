@@ -16,15 +16,12 @@ row 0, and its rows reach the step's snapshot at the step's row offset."""
 
 from functools import partial
 from types import SimpleNamespace
-from typing import cast
 
 import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
 import torch._dynamo.utils
-from vllm.config import VllmConfig
-from vllm.distributed.aux_output_connector import worker as aux_output_worker
 from vllm.distributed.aux_output_connector.connector import (
     AuxOutputConnectorMetadata,
 )
@@ -32,67 +29,28 @@ from vllm.forward_context import set_forward_context
 from vllm.platforms import current_platform
 
 from tests.distributed.tpu_test_utils import run_in_isolated_process
+from tests.layers.adapter.routed_experts_test_utils import (
+    MAX_NUM_BATCHED_TOKENS,
+    NUM_LAYERS,
+    PADDING,
+    TOKEN_PADDINGS,
+    TOPK,
+    expert_ids,
+    make_capturer,
+    make_vllm_config,
+    make_vllm_connector,
+    stage_rows_on_host,
+)
 from vllm_torchtpu import utils
-from vllm_torchtpu.distributed import aux_output_connector
 from vllm_torchtpu.layers.adapter import routed_experts_capturer
 
-NUM_LAYERS, TOPK = 3, 4
-TOKEN_PADDINGS = [16, 32, 64]
-MAX_NUM_BATCHED_TOKENS = 64
 STAGING_ROWS = MAX_NUM_BATCHED_TOKENS + TOKEN_PADDINGS[-1]
-BLOCK_SIZE = 4
-# Marks padding rows; `_ids(..., num_experts=PADDING)` stays below it.
-PADDING = 511
 TPU = "tpu"
-
-
-def _vllm_config(num_experts=512):
-    model_config = SimpleNamespace(
-        get_total_num_hidden_layers=lambda: NUM_LAYERS,
-        get_num_experts=lambda: num_experts,
-        get_num_experts_per_tok=lambda: TOPK,
-        hf_text_config=SimpleNamespace(model_type="qwen3_moe"),
-    )
-    vllm_config = SimpleNamespace(
-        model_config=model_config,
-        scheduler_config=SimpleNamespace(
-            max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS, max_num_seqs=8
-        ),
-        parallel_config=SimpleNamespace(
-            data_parallel_rank=0,
-            data_parallel_size=1,
-            tensor_parallel_size=1,
-            decode_context_parallel_size=1,
-            use_sequence_parallel_moe=False,
-            is_moe_model=True,
-        ),
-        cache_config=SimpleNamespace(block_size=BLOCK_SIZE, prefix_match_unit=None),
-        compilation_config=SimpleNamespace(
-            fast_moe_cold_start=False, static_forward_context={}
-        ),
-        aux_output_config=SimpleNamespace(max_bytes=None),
-        max_concurrent_batches=2,
-    )
-    return cast(VllmConfig, vllm_config)
-
-
-def _capturer(num_experts=512, with_staging=True):
-    return routed_experts_capturer.TPURoutedExpertsCapturer(
-        _vllm_config(num_experts), TOKEN_PADDINGS, with_staging=with_staging
-    )
-
-
-def _ids(num_tokens, num_experts=512, seed=0):
-    """[num_tokens, layers, k] int32 expert ids, from the host generator only:
-    seeding torch would also open the chip in this process."""
-    rng = np.random.default_rng(seed)
-    ids = rng.integers(num_experts, size=(num_tokens, NUM_LAYERS, TOPK))
-    return torch.from_numpy(ids.astype(np.int32))
 
 
 def _forward(capturer, ids, device):
     """One forward's hook calls, under the forward context vLLM's hook reads."""
-    with set_forward_context(None, _vllm_config(), num_tokens=ids.shape[0]):
+    with set_forward_context(None, make_vllm_config(), num_tokens=ids.shape[0]):
         for layer in range(NUM_LAYERS):
             capturer.capture(layer, ids[:, layer].to(device))
 
@@ -100,7 +58,7 @@ def _forward(capturer, ids, device):
 @pytest.fixture
 def cpu_capturer(monkeypatch):
     monkeypatch.setattr(current_platform, "device_type", "cpu")
-    return _capturer()
+    return make_capturer()
 
 
 @pytest.mark.parametrize("is_warmup", [False, True])
@@ -116,9 +74,11 @@ def test_capture_traces_once_for_every_bucket(cpu_capturer, is_warmup):
         dynamic=True,
     )
     for num_tokens in (16, 32):
-        ids = _ids(num_tokens)[:, 1]
+        ids = expert_ids(num_tokens)[:, 1]
         context_num_tokens = 0 if is_warmup else num_tokens
-        with set_forward_context(None, _vllm_config(), num_tokens=context_num_tokens):
+        with set_forward_context(
+            None, make_vllm_config(), num_tokens=context_num_tokens
+        ):
             compiled(ids)
         assert torch.equal(cpu_capturer.device_buffer[:num_tokens, 1], ids)
 
@@ -128,16 +88,16 @@ def test_capture_traces_once_for_every_bucket(cpu_capturer, is_warmup):
 
 def test_capture_rejects_a_layer_past_the_table(cpu_capturer):
     with (
-        set_forward_context(None, _vllm_config(), num_tokens=16),
+        set_forward_context(None, make_vllm_config(), num_tokens=16),
         pytest.raises(IndexError, match="exceeds capture buffer"),
     ):
-        cpu_capturer.capture(NUM_LAYERS, _ids(16)[:, 0])
+        cpu_capturer.capture(NUM_LAYERS, expert_ids(16)[:, 0])
 
 
 @pytest.mark.parametrize("row_offset", [0, 7, STAGING_ROWS - 16])
 def test_staging_writes_rows_at_the_offset(row_offset):
     staging = np.zeros((STAGING_ROWS, NUM_LAYERS, TOPK), dtype=np.uint16)
-    rows = _ids(16).numpy()
+    rows = expert_ids(16).numpy()
 
     staged = routed_experts_capturer._stage_rows_jax(
         jnp.asarray(staging), jnp.asarray(rows), jnp.asarray([row_offset], jnp.int32)
@@ -157,7 +117,7 @@ def test_staging_past_the_table_raises(cpu_capturer):
 def test_without_staging_only_the_table_is_written(monkeypatch):
     """Every rank can call stage_rows; only a staging rank has a snapshot."""
     monkeypatch.setattr(current_platform, "device_type", "cpu")
-    capturer = _capturer(with_staging=False)
+    capturer = make_capturer(with_staging=False)
 
     capturer.stage_rows(16, 0)
 
@@ -174,45 +134,6 @@ def test_snapshot_is_a_bucket_sized_copy(cpu_capturer):
 
     assert first.shape[0] == 32 and first.dtype == torch.uint16
     assert not second.any()
-
-
-def _stage_rows_on_host(staging, rows, row_offset):
-    """The staging op's JAX body, for tests without a chip."""
-    staged = routed_experts_capturer._stage_rows_jax(
-        jnp.asarray(staging.numpy()),
-        jnp.asarray(rows.numpy()),
-        jnp.asarray(row_offset.numpy()),
-    )
-    return torch.from_numpy(np.array(staged))
-
-
-class _MoELayer(torch.nn.Module):
-    """A MoE layer as vLLM's capturer binder finds it."""
-
-    def __init__(self, layer_id):
-        super().__init__()
-        self.layer_id = layer_id
-        self.capture_fn = None
-
-
-def _moe_model():
-    return torch.nn.ModuleList(_MoELayer(layer) for layer in range(NUM_LAYERS))
-
-
-def _vllm_connector(monkeypatch, capturer, model=None):
-    """vLLM's worker connector on the output rank, built through its
-    constructor; on `capturer` unless that is None. Close it after use."""
-    tp_group = SimpleNamespace(is_first_rank=True)
-    monkeypatch.setattr(aux_output_worker, "get_tp_group", lambda: tp_group)
-    model = _moe_model() if model is None else model
-    connector = aux_output_worker.AuxOutputWorkerConnector(
-        vllm_config=_vllm_config(),
-        model=model,
-        kv_cache_config=SimpleNamespace(num_blocks=1024, kv_cache_groups=[]),
-    )
-    if capturer is not None:
-        aux_output_connector.use_capturer(connector, model, capturer)
-    return connector
 
 
 def _run_step(connector, capturer, ids, requests, block_hashes, finished=()):
@@ -245,7 +166,7 @@ def _run_step(connector, capturer, ids, requests, block_hashes, finished=()):
 
 @pytest.fixture
 def cpu_connector(monkeypatch, cpu_capturer):
-    connector = _vllm_connector(monkeypatch, cpu_capturer)
+    connector = make_vllm_connector(monkeypatch, cpu_capturer)
     yield connector
     connector.close()
 
@@ -257,11 +178,11 @@ def test_vllm_connector_never_reads_the_snapshot_padding(
     real row count, which is safe while vLLM's connector hands out and caches
     request rows only. A failure here means `snapshot_routing_data` has to
     change."""
-    monkeypatch.setattr(routed_experts_capturer, "_STAGE_ROWS_OP", _stage_rows_on_host)
+    monkeypatch.setattr(routed_experts_capturer, "_STAGE_ROWS_OP", stage_rows_on_host)
     step = partial(_run_step, cpu_connector, cpu_capturer)
     hashes = [b"a" * 32, b"b" * 32]
     # 10 real rows, then padding up to the bucket.
-    ids = _ids(16, num_experts=PADDING)
+    ids = expert_ids(16, num_experts=PADDING)
     ids[10:] = PADDING
 
     outputs = step(ids, {"first": (0, 8), "second": (0, 2)}, {"first": hashes})
@@ -271,7 +192,7 @@ def test_vllm_connector_never_reads_the_snapshot_padding(
     assert np.array_equal(outputs["second"].rows, ids[8:10].numpy())
 
     # A prefix hit on both of `first`'s blocks reads them back from the cache.
-    next_ids = _ids(16, num_experts=PADDING, seed=1)
+    next_ids = expert_ids(16, num_experts=PADDING, seed=1)
     next_ids[1:] = PADDING
     outputs = step(next_ids, {"third": (8, 1)}, {"third": hashes}, ("first", "second"))
 
@@ -288,7 +209,7 @@ def _tpu_capturer(num_experts=512):
 
     # The engine runs eager ops in this mode.
     execution_mode.eager_mode = execution_mode.EagerMode.DEFER_AND_FUSE
-    capturer = _capturer(num_experts)
+    capturer = make_capturer(num_experts)
     # Otherwise the deferred zero fills join the first write's program.
     utils.synchronize_tensors()
     return capturer
@@ -300,7 +221,7 @@ def _step_rows_reach_the_snapshot_on_tpu(num_experts):
     forwards = [(20, 32), (9, 16), (5, 16)]
     expected, row_offset = [], 0
     for seed, (num_tokens, bucket) in enumerate(forwards):
-        ids = _ids(bucket, num_experts, seed)
+        ids = expert_ids(bucket, num_experts, seed)
         _forward(capturer, ids, TPU)
         capturer.stage_rows(bucket, row_offset)
         expected.append(ids[:num_tokens])
@@ -309,7 +230,7 @@ def _step_rows_reach_the_snapshot_on_tpu(num_experts):
     copied = torch.tpu.Event()
     copied.record()
     # The next step rewrites the staging table before that copy is waited on.
-    _forward(capturer, _ids(16, num_experts, seed=9), TPU)
+    _forward(capturer, expert_ids(16, num_experts, seed=9), TPU)
     capturer.stage_rows(16, 0)
     capturer.snapshot_routing_data(16).cpu()
     copied.synchronize()
