@@ -20,6 +20,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 import torch
+from runner_input_test_utils import plain_step_runner, run_sample_tokens
 from vllm import SamplingParams
 from vllm.sampling_params import StructuredOutputsParams
 from vllm.v1.sample.logits_processor import LogitsProcessors
@@ -572,74 +573,14 @@ def test_top_tokens_step_needs_the_full_logits_below_min_tokens():
 
 
 def _plain_step_runner(num_output, logits, req_id="r0"):
-    """The runner state sample_tokens reads for one greedy request in a plain
-    (non-speculative, synchronous) step, picking the argmax of what it gets.
-    With `num_output`, request `req_id` has that many outputs, min_tokens 4
-    and stop token 3."""
-    runner = SimpleNamespace(
-        execute_model_state=SimpleNamespace(
-            scheduler_output=SimpleNamespace(
-                num_scheduled_tokens={"r0": 1},
-                finished_req_ids=set(),
-                has_structured_output_requests=False,
-            ),
-            draft_chunks=[],
-            logits_list=[logits],
-            num_reqs_list=[1],
-            spec_decode_metadata_list=[None],
-            mamba_state_indices_list=None,
-            pooler_output_list=[],
-            top_tokens=False,
-            kv_save_nan_check=None,
-        ),
-        input_batch=SimpleNamespace(
-            max_num_logprobs=None,
-            num_reqs=1,
-            req_ids=["r0"],
-            req_id_to_index={"r0": 0},
-            all_greedy=True,
-            num_tokens_no_spec=[1],
-            token_ids_cpu=np.zeros((1, 8), dtype=np.int32),
-        ),
-        requests={
-            "r0": SimpleNamespace(
-                num_computed_tokens=0, num_tokens=1, output_token_ids=[]
-            )
-        },
-        _pre_async_results=None,
-        _pp_wave=None,
-        _dp_step_other_decode=False,
-        _min_tokens=min_tokens.MinTokensTracker(),
-        _repetition_penalty=SimpleNamespace(begin_step=lambda _batch: False),
-        speculative_config=None,
-        scheduler_config=SimpleNamespace(async_scheduling=False),
-        _is_async_drafter=False,
-        _fence_spec_kv_under_token_copy=False,
-        _is_dspark_pd_producer=False,
-        _adaptive_verification=None,
-        is_pooling_model=False,
-        _get_sampling_generator=lambda: None,
-        _greedy_sample=lambda x: torch.argmax(x, dim=-1),
-        _update_mamba_slot_read_offsets=lambda *_args: None,
-        _update_num_xla_graphs=lambda *_args: None,
-        _modify_prev_results=lambda: None,
-        _stage_timing=MagicMock(),
-    )
-    runner._stage_timing.take_samples.return_value = ([], [])
+    """`plain_step_runner` state for one greedy request. With `num_output`,
+    request `req_id` has that many outputs, min_tokens 4 and stop token 3."""
+    runner = plain_step_runner(logits)
     if num_output is not None:
         runner._min_tokens.add(req_id, SamplingParams(min_tokens=4, stop_token_ids=[3]))
         runner.requests[req_id] = SimpleNamespace(
             num_computed_tokens=0, num_tokens=1, output_token_ids=[0] * num_output
         )
-    for name in (
-        "_mask_min_tokens",
-        "_min_tokens_batch_state",
-        "_settle_draft_placeholders_for_min_tokens",
-        "_num_output_tokens",
-        "maybe_wait_for_kv_save",
-        "get_finished_kv_transfers",
-    ):
-        setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
     return runner
 
 
@@ -691,7 +632,7 @@ def test_plain_step_masks_random_sampling_below_min_tokens(num_output, expected)
     runner._get_sampling_generator = lambda: torch.Generator().manual_seed(0)
     runner._apply_temperature = TPUModelRunner._apply_temperature.__get__(runner)
     runner.sample_from_logits_func = TPUModelRunner.sample_from_logits.__get__(runner)
-    assert _run_sample_tokens(runner).sampled_token_ids == [[expected]]
+    assert run_sample_tokens(runner).sampled_token_ids == [[expected]]
 
 
 def test_sample_tokens_settles_async_placeholders_before_it_counts():
@@ -705,7 +646,7 @@ def test_sample_tokens_settles_async_placeholders_before_it_counts():
         return batch_state(*args)
 
     runner._min_tokens.batch_state = counted
-    _run_sample_tokens(runner)
+    run_sample_tokens(runner)
     assert calls == ["settle", "count"]
 
 
@@ -850,25 +791,6 @@ def _spec_step_runner(num_output, logits_list, md_list, req_ids):
     return runner
 
 
-def _run_sample_tokens(runner):
-    def host_copy(chunks, lengths, spec_logprobs=None):
-        return AsyncTPUCopyState(
-            chunks_cpu=chunks,
-            chunk_real_lens=lengths,
-            copy_ready_event=MagicMock(),
-            spec_logprobs=spec_logprobs,
-        )
-
-    with (
-        patch(
-            "vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group", return_value=False
-        ),
-        patch.object(AsyncTPUCopyState, "from_device_chunks", side_effect=host_copy),
-        torch.compiler.set_stance("force_eager"),
-    ):
-        return TPUModelRunner.sample_tokens(runner, None)
-
-
 def _one_request_verify_md():
     """One request, drafts [3, 3, 3]; every row prefers token 3 (logit 4),
     then token 6 (logit 2)."""
@@ -895,7 +817,7 @@ def test_spec_step_masks_verify_chunks_through_sample_tokens(num_output, expecte
     """sample_tokens hands this step's min_tokens rows to the real verify."""
     logits, md = _one_request_verify_md()
     runner = _spec_step_runner(num_output, [logits], [md], ["r0"])
-    assert _run_sample_tokens(runner).sampled_token_ids == [expected]
+    assert run_sample_tokens(runner).sampled_token_ids == [expected]
 
 
 def test_spec_step_draft_less_chunk_logprobs_come_from_the_unmasked_logits():
@@ -919,7 +841,7 @@ def test_spec_step_draft_less_chunk_logprobs_come_from_the_unmasked_logits():
         )
 
     runner.gather_logprobs = gather_logprobs
-    output = _run_sample_tokens(runner)
+    output = run_sample_tokens(runner)
     assert output.sampled_token_ids[1] == [5]  # r1 sampled from the masked logits
     assert seen[-1][0, 3] == 4.0  # its logprobs from the raw ones
 

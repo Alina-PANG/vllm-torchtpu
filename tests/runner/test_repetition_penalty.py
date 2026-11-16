@@ -22,6 +22,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 import torch
+from runner_input_test_utils import plain_step_runner, run_sample_tokens
 from vllm import SamplingParams
 from vllm.utils.math_utils import cdiv
 from vllm.v1.outputs import LogprobsTensors
@@ -31,7 +32,6 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm_torchtpu.runner import greedy_top_tokens, min_tokens
 from vllm_torchtpu.runner import repetition_penalty as rep_pen
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
-from vllm_torchtpu.runner.tpu_runner_async_output import AsyncTPUCopyState
 
 NEG_INF = float("-inf")
 
@@ -67,6 +67,15 @@ def _batch(rows: dict[str, tuple[float, list[int]]], order: list[str]):
         repetition_penalties_reqs={r for r in order if rows[r][0] != 1.0},
         repetition_penalties_cpu=np.array([rows[r][0] for r in order], np.float32),
         req_output_token_ids=[rows[r][1] for r in order],
+    )
+
+
+def _tracker_in_mode(vocab_size: int, async_scheduling: bool, spec):
+    return rep_pen.RepetitionPenaltyTracker(
+        vocab_size,
+        8,
+        async_scheduling=async_scheduling,
+        speculative_decoding=spec is not None,
     )
 
 
@@ -213,103 +222,14 @@ class TestScalingMath:
         )
 
 
-def _plain_runner(logits: torch.Tensor, async_scheduling: bool = False, spec=None):
-    runner = SimpleNamespace(
-        execute_model_state=SimpleNamespace(
-            scheduler_output=SimpleNamespace(
-                num_scheduled_tokens={"r0": 1},
-                finished_req_ids=set(),
-                has_structured_output_requests=False,
-            ),
-            draft_chunks=[],
-            logits_list=[logits],
-            num_reqs_list=[1],
-            spec_decode_metadata_list=[None],
-            mamba_state_indices_list=None,
-            pooler_output_list=[],
-            top_tokens=False,
-            kv_save_nan_check=None,
-        ),
-        input_batch=SimpleNamespace(
-            max_num_logprobs=None,
-            num_reqs=1,
-            req_ids=["r0"],
-            req_id_to_index={"r0": 0},
-            all_greedy=True,
-            num_tokens_no_spec=[2],
-            token_ids_cpu=np.zeros((1, 16), dtype=np.int32),
-            repetition_penalties_reqs=set(),
-            repetition_penalties_cpu=np.ones(1, dtype=np.float32),
-            req_output_token_ids=[],
-        ),
-        requests={
-            "r0": SimpleNamespace(
-                req_id="r0",
-                prompt_token_ids=[4],
-                num_computed_tokens=1,
-                num_tokens=2,
-                output_token_ids=[],
-            )
-        },
-        _pre_async_results=None,
-        _pp_wave=None,
-        _dp_step_other_decode=False,
-        _min_tokens=min_tokens.MinTokensTracker(),
-        _repetition_penalty=rep_pen.RepetitionPenaltyTracker(
-            vocab_size=logits.shape[1],
-            max_num_reqs=8,
-            async_scheduling=async_scheduling,
-            speculative_decoding=spec is not None,
-        ),
-        speculative_config=spec,
-        scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
-        _is_async_drafter=False,
-        _fence_spec_kv_under_token_copy=False,
-        _is_dspark_pd_producer=False,
-        _adaptive_verification=None,
-        is_pooling_model=False,
-        _get_sampling_generator=lambda: None,
-        _greedy_sample=lambda x: torch.argmax(x, dim=-1, keepdim=True),
-        _update_mamba_slot_read_offsets=lambda *_args: None,
-        _update_num_xla_graphs=lambda *_args: None,
-        _modify_prev_results=MagicMock(),
-        _sync_replicated_drafts_across_tp=lambda drafts: drafts,
-        _update_placeholder=lambda *_args: {"r0": 0},
-        _stage_timing=MagicMock(),
-    )
-    runner._stage_timing.take_samples.return_value = ([], [])
-    runner.input_batch.req_output_token_ids.append(
-        runner.requests["r0"].output_token_ids
-    )
-    for name in (
-        "_mask_min_tokens",
-        "_min_tokens_batch_state",
-        "_num_output_tokens",
-        "_settle_draft_placeholders_for_min_tokens",
-        "get_finished_kv_transfers",
-        "maybe_wait_for_kv_save",
-    ):
-        setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
+def _penalized_runner(logits: torch.Tensor, penalty: float = 1.5):
+    """`plain_step_runner` state where request `r0` has prompt `[4]` and
+    `repetition_penalty` `penalty`."""
+    runner = plain_step_runner(logits)
+    runner.requests["r0"].prompt_token_ids = [4]
+    runner.input_batch.repetition_penalties_reqs.add("r0")
+    runner.input_batch.repetition_penalties_cpu[0] = penalty
     return runner
-
-
-def _run_sample_tokens(runner):
-    def host_copy(chunks, lengths, spec_logprobs=None):
-        return AsyncTPUCopyState(
-            chunks_cpu=chunks,
-            chunk_real_lens=lengths,
-            copy_ready_event=MagicMock(),
-            spec_logprobs=spec_logprobs,
-        )
-
-    with (
-        patch(
-            "vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group", return_value=False
-        ),
-        patch.object(AsyncTPUCopyState, "from_device_chunks", side_effect=host_copy),
-        torch.compiler.set_stance("force_eager"),
-    ):
-        return TPUModelRunner.sample_tokens(runner, None)
 
 
 @pytest.mark.usefixtures("eager")
@@ -320,9 +240,7 @@ class TestRunnerIntegration:
         # while raw logprobs still read 3.0 on token 4.
         logits = torch.zeros(1, 8)
         logits[0, 4], logits[0, 2] = 3.0, 2.5
-        runner = _plain_runner(logits)
-        runner.input_batch.repetition_penalties_reqs.add("r0")
-        runner.input_batch.repetition_penalties_cpu[0] = 1.5
+        runner = _penalized_runner(logits)
         runner.input_batch.max_num_logprobs = 0
         seen_logprob_logits: list[torch.Tensor] = []
 
@@ -333,7 +251,7 @@ class TestRunnerIntegration:
             )
 
         runner.gather_logprobs = gather_logprobs
-        out = _run_sample_tokens(runner)
+        out = run_sample_tokens(runner)
         assert out.sampled_token_ids == [[2]]
         assert seen_logprob_logits[0][0, 4].item() == pytest.approx(3.0)
 
@@ -406,9 +324,8 @@ class TestRunnerIntegration:
     def test_unsupported_modes_skip_penalty_with_warning(self, async_scheduling, spec):
         """An unsupported mode logs warning_once, applies nothing and keeps the
         greedy top-tokens fast path open."""
-        runner = _plain_runner(torch.zeros(1, 8), async_scheduling, spec)
-        runner.input_batch.repetition_penalties_reqs.add("r0")
-        runner.input_batch.repetition_penalties_cpu[0] = 1.5
+        runner = _penalized_runner(torch.zeros(1, 8))
+        runner._repetition_penalty = _tracker_in_mode(8, async_scheduling, spec)
         with patch.object(rep_pen, "logger") as log:
             assert not runner._repetition_penalty.begin_step(runner.input_batch)
         log.warning_once.assert_called_once()
