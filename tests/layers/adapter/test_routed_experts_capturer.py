@@ -14,7 +14,6 @@
 """TPU routed-experts capture: every forward of a step writes the table from
 row 0, and its rows reach the step's snapshot at the step's row offset."""
 
-import threading
 from functools import partial
 from types import SimpleNamespace
 from typing import cast
@@ -25,17 +24,16 @@ import pytest
 import torch
 import torch._dynamo.utils
 from vllm.config import VllmConfig
+from vllm.distributed.aux_output_connector import worker as aux_output_worker
 from vllm.distributed.aux_output_connector.connector import (
     AuxOutputConnectorMetadata,
 )
-from vllm.distributed.aux_output_connector.routed_experts import RoutedExpertsBuffer
-from vllm.distributed.aux_output_connector.store import BlockObjectStore
-from vllm.distributed.aux_output_connector.worker import AuxOutputWorkerConnector
 from vllm.forward_context import set_forward_context
 from vllm.platforms import current_platform
 
 from tests.distributed.tpu_test_utils import run_in_isolated_process
 from vllm_torchtpu import utils
+from vllm_torchtpu.distributed import aux_output_connector
 from vllm_torchtpu.layers.adapter import routed_experts_capturer
 
 NUM_LAYERS, TOPK = 3, 4
@@ -57,17 +55,23 @@ def _vllm_config(num_experts=512):
     )
     vllm_config = SimpleNamespace(
         model_config=model_config,
-        scheduler_config=SimpleNamespace(max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS),
+        scheduler_config=SimpleNamespace(
+            max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS, max_num_seqs=8
+        ),
         parallel_config=SimpleNamespace(
             data_parallel_rank=0,
             data_parallel_size=1,
             tensor_parallel_size=1,
+            decode_context_parallel_size=1,
             use_sequence_parallel_moe=False,
             is_moe_model=True,
         ),
+        cache_config=SimpleNamespace(block_size=BLOCK_SIZE, prefix_match_unit=None),
         compilation_config=SimpleNamespace(
             fast_moe_cold_start=False, static_forward_context={}
         ),
+        aux_output_config=SimpleNamespace(max_bytes=None),
+        max_concurrent_batches=2,
     )
     return cast(VllmConfig, vllm_config)
 
@@ -182,26 +186,32 @@ def _stage_rows_on_host(staging, rows, row_offset):
     return torch.from_numpy(np.array(staged))
 
 
-def _vllm_connector(capturer):
-    """vLLM's worker connector around `capturer`, built the way vLLM's own
-    connector tests build it."""
-    dtype = np.dtype(capturer.output_dtype_name)
-    shape = capturer.shape_per_token
-    connector = object.__new__(AuxOutputWorkerConnector)
-    connector._capturer = capturer
-    connector._store = BlockObjectStore(
-        max_bytes=1 << 20,
-        object_nbytes=BLOCK_SIZE * int(np.prod(shape)) * dtype.itemsize,
+class _MoELayer(torch.nn.Module):
+    """A MoE layer as vLLM's capturer binder finds it."""
+
+    def __init__(self, layer_id):
+        super().__init__()
+        self.layer_id = layer_id
+        self.capture_fn = None
+
+
+def _moe_model():
+    return torch.nn.ModuleList(_MoELayer(layer) for layer in range(NUM_LAYERS))
+
+
+def _vllm_connector(monkeypatch, capturer, model=None):
+    """vLLM's worker connector on the output rank, built through its
+    constructor; on `capturer` unless that is None. Close it after use."""
+    tp_group = SimpleNamespace(is_first_rank=True)
+    monkeypatch.setattr(aux_output_worker, "get_tp_group", lambda: tp_group)
+    model = _moe_model() if model is None else model
+    connector = aux_output_worker.AuxOutputWorkerConnector(
+        vllm_config=_vllm_config(),
+        model=model,
+        kv_cache_config=SimpleNamespace(num_blocks=1024, kv_cache_groups=[]),
     )
-    connector._buffer = RoutedExpertsBuffer(
-        dtype, shape, BLOCK_SIZE, 4, MAX_NUM_BATCHED_TOKENS, 2
-    )
-    connector._requests = {}
-    connector._generation = 0
-    connector._step_metadata = None
-    connector._pending_outputs = []
-    connector._lock = threading.Lock()
-    connector._max_concurrent_batches = 2
+    if capturer is not None:
+        aux_output_connector.use_capturer(connector, model, capturer)
     return connector
 
 
@@ -233,13 +243,22 @@ def _run_step(connector, capturer, ids, requests, block_hashes, finished=()):
     return pending.process_output()
 
 
-def test_vllm_connector_never_reads_the_snapshot_padding(cpu_capturer, monkeypatch):
+@pytest.fixture
+def cpu_connector(monkeypatch, cpu_capturer):
+    connector = _vllm_connector(monkeypatch, cpu_capturer)
+    yield connector
+    connector.close()
+
+
+def test_vllm_connector_never_reads_the_snapshot_padding(
+    cpu_connector, cpu_capturer, monkeypatch
+):
     """`snapshot_routing_data` returns a whole bucket where vLLM's returns the
     real row count, which is safe while vLLM's connector hands out and caches
     request rows only. A failure here means `snapshot_routing_data` has to
     change."""
     monkeypatch.setattr(routed_experts_capturer, "_STAGE_ROWS_OP", _stage_rows_on_host)
-    step = partial(_run_step, _vllm_connector(cpu_capturer), cpu_capturer)
+    step = partial(_run_step, cpu_connector, cpu_capturer)
     hashes = [b"a" * 32, b"b" * 32]
     # 10 real rows, then padding up to the bucket.
     ids = _ids(16, num_experts=PADDING)
