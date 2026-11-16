@@ -38,8 +38,12 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import torch
 
+from vllm_torchtpu.logger import init_logger
+
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu_input_batch import InputBatch
+
+logger = init_logger(__name__)
 
 _BIT_MASKS: np.ndarray = (np.uint32(1) << np.arange(32, dtype=np.uint32)).view(np.int32)
 
@@ -104,8 +108,20 @@ class RepetitionPenaltyTracker:
     ``InputBatch.repetition_penalties_reqs`` lists, and the host staging
     buffers for one logits chunk of at most ``max_num_reqs`` rows."""
 
-    def __init__(self, vocab_size: int, max_num_reqs: int) -> None:
+    def __init__(
+        self,
+        vocab_size: int,
+        max_num_reqs: int,
+        *,
+        async_scheduling: bool,
+        speculative_decoding: bool,
+    ) -> None:
         self.vocab_size = vocab_size
+        # TODO(#2861): apply under async_scheduling. There the previous step's
+        # sampled token is still on the device when the bitmask is built.
+        # TODO(#2862): apply in speculative decoding. There each verify row
+        # needs the bitmask plus its draft prefix.
+        self.supported = not async_scheduling and not speculative_decoding
         self._seen: dict[str, SeenTokenBitmask] = {}
         self._bitmask_buf = np.zeros(
             (max_num_reqs, num_bitmask_words(vocab_size)), dtype=np.int32
@@ -113,7 +129,45 @@ class RepetitionPenaltyTracker:
         self._penalties_buf = np.ones((max_num_reqs, 1), dtype=np.float32)
         self._dirty_rows: list[int] = []
 
-    def prune(self, req_ids: Collection[str]) -> None:
+    def active(self, input_batch: InputBatch) -> bool:
+        """Whether a row of ``input_batch`` gets the penalty in this mode."""
+        return self.supported and bool(input_batch.repetition_penalties_reqs)
+
+    def begin_step(self, input_batch: InputBatch) -> bool:
+        """``active(input_batch)``, warning once when a penalized request runs
+        in an unsupported mode, and dropping the bitmasks of requests that are
+        no longer penalized."""
+        penalized = input_batch.repetition_penalties_reqs
+        if not penalized:
+            return False
+        if not self.supported:
+            logger.warning_once(
+                "repetition_penalty is not yet applied on TPU with "
+                "async_scheduling or speculative decoding; requests run without "
+                "it. Run with async_scheduling=False and no speculative_config "
+                "to apply it."
+            )
+            return False
+        self._prune(penalized)
+        return True
+
+    def apply(
+        self,
+        logits: torch.Tensor,
+        input_batch: InputBatch,
+        requests: Mapping[str, Any],
+        start: int,
+        end: int,
+    ) -> torch.Tensor:
+        """Scale the plain 1-row/req logits chunk of batch rows ``[start, end)``."""
+        inputs = self.build_plain_inputs(
+            input_batch, requests, start, end, logits.shape[0]
+        )
+        if inputs is None:
+            return logits
+        return apply_penalties_table(logits, *inputs)
+
+    def _prune(self, req_ids: Collection[str]) -> None:
         """Drop the bitmasks of requests that are not in ``req_ids``."""
         if len(self._seen) > len(req_ids):
             for req_id in [r for r in self._seen if r not in req_ids]:

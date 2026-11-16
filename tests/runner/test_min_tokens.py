@@ -552,12 +552,12 @@ def test_top_tokens_step_needs_the_full_logits_below_min_tokens():
     params = SamplingParams(temperature=0)
     runner.requests = {"r0": SimpleNamespace(sampling_params=params)}
     runner._min_tokens = min_tokens.MinTokensTracker()
+    runner._repetition_penalty = SimpleNamespace(active=lambda _batch: False)
     batch = SimpleNamespace(
         all_greedy=True,
         max_num_logprobs=None,
         req_ids=["r0"],
         req_id_to_index={"r0": 0},
-        repetition_penalties_reqs=set(),
     )
     runner.input_batch = batch
     assert runner._greedy_top_tokens_this_step()
@@ -610,7 +610,7 @@ def _plain_step_runner(num_output, logits, req_id="r0"):
         _pp_wave=None,
         _dp_step_other_decode=False,
         _min_tokens=min_tokens.MinTokensTracker(),
-        _repetition_penalty_active=lambda: False,
+        _repetition_penalty=SimpleNamespace(begin_step=lambda _batch: False),
         speculative_config=None,
         scheduler_config=SimpleNamespace(async_scheduling=False),
         _is_async_drafter=False,

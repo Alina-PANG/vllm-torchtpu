@@ -69,6 +69,12 @@ def _batch(rows: dict[str, tuple[float, list[int]]], order: list[str]):
     )
 
 
+def _tracker(vocab_size: int, max_num_reqs: int = 8):
+    return rep_pen.RepetitionPenaltyTracker(
+        vocab_size, max_num_reqs, async_scheduling=False, speculative_decoding=False
+    )
+
+
 class TestSeenTokenBitmask:
     def test_incremental_update_rollback_and_out_of_range_ids(self):
         seen = rep_pen.SeenTokenBitmask(vocab_size=64)
@@ -118,7 +124,7 @@ class TestSeenTokenBitmask:
 
 class TestTracker:
     def test_reads_rows_penalties_and_outputs_from_the_batch(self):
-        tracker = rep_pen.RepetitionPenaltyTracker(vocab_size=64, max_num_reqs=8)
+        tracker = _tracker(vocab_size=64)
         requests = {
             "a": SimpleNamespace(prompt_token_ids=[1]),
             "b": SimpleNamespace(prompt_token_ids=[2]),
@@ -155,12 +161,12 @@ class TestTracker:
         )
 
     def test_prune_drops_requests_that_left_the_penalized_set(self):
-        tracker = rep_pen.RepetitionPenaltyTracker(vocab_size=8, max_num_reqs=8)
+        tracker = _tracker(vocab_size=8)
         requests = {r: SimpleNamespace(prompt_token_ids=[1]) for r in "ab"}
         rows = {"a": (1.1, []), "b": (1.2, [])}
         tracker.build_plain_inputs(_batch(rows, ["a", "b"]), requests, 0, 2, num_rows=2)
         assert sorted(tracker._seen) == ["a", "b"]
-        tracker.prune({"b"})
+        assert tracker.begin_step(_batch(rows, ["b"]))
         assert sorted(tracker._seen) == ["b"]
 
 
@@ -249,7 +255,10 @@ def _plain_runner(logits: torch.Tensor, async_scheduling: bool = False, spec=Non
         _dp_step_other_decode=False,
         _min_tokens=min_tokens.MinTokensTracker(),
         _repetition_penalty=rep_pen.RepetitionPenaltyTracker(
-            vocab_size=logits.shape[1], max_num_reqs=8
+            vocab_size=logits.shape[1],
+            max_num_reqs=8,
+            async_scheduling=async_scheduling,
+            speculative_decoding=spec is not None,
         ),
         speculative_config=spec,
         scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
@@ -272,14 +281,10 @@ def _plain_runner(logits: torch.Tensor, async_scheduling: bool = False, spec=Non
         runner.requests["r0"].output_token_ids
     )
     for name in (
-        "_apply_repetition_penalty_plain",
         "_mask_min_tokens",
         "_min_tokens_batch_state",
         "_num_output_tokens",
-        "_repetition_penalty_active",
-        "_repetition_penalty_supported",
         "_settle_draft_placeholders_for_min_tokens",
-        "_warn_repetition_penalty_unsupported",
         "get_finished_kv_transfers",
         "maybe_wait_for_kv_save",
     ):
@@ -377,14 +382,17 @@ class TestRunnerIntegration:
         runner._greedy_head_owner = object()
         runner._min_tokens = min_tokens.MinTokensTracker()
         runner._repetition_penalty = rep_pen.RepetitionPenaltyTracker(
-            vocab_size=16, max_num_reqs=4
+            vocab_size=16,
+            max_num_reqs=4,
+            async_scheduling=False,
+            speculative_decoding=False,
         )
 
         assert batch.repetition_penalties_reqs == {"a"}
         assert not runner._greedy_top_tokens_this_step()
-        assert runner._repetition_penalty_active()
+        assert runner._repetition_penalty.begin_step(batch)
         logits = torch.full((4, 16), 2.0)
-        out = runner._apply_repetition_penalty_plain(logits, 0, 2)
+        out = runner._repetition_penalty.apply(logits, batch, runner.requests, 0, 2)
         # Row 0 ("b") untouched; row 1 ("a") scaled at tokens 3 and 5.
         assert torch.equal(out[0], logits[0])
         assert out[1, 3].item() == pytest.approx(1.0)
@@ -397,13 +405,11 @@ class TestRunnerIntegration:
     def test_unsupported_modes_skip_penalty_with_warning(self, async_scheduling, spec):
         """An unsupported mode logs warning_once, applies nothing and keeps the
         greedy top-tokens fast path open."""
-        runner = _plain_runner(torch.zeros(1, 8))
-        runner.scheduler_config = SimpleNamespace(async_scheduling=async_scheduling)
-        runner.speculative_config = spec
+        runner = _plain_runner(torch.zeros(1, 8), async_scheduling, spec)
         runner.input_batch.repetition_penalties_reqs.add("r0")
         runner.input_batch.repetition_penalties_cpu[0] = 1.5
-        with patch("vllm_torchtpu.runner.tpu_runner.logger") as log:
-            assert not runner._repetition_penalty_active()
+        with patch.object(rep_pen, "logger") as log:
+            assert not runner._repetition_penalty.begin_step(runner.input_batch)
         log.warning_once.assert_called_once()
         assert "async_scheduling=False" in log.warning_once.call_args.args[0]
         runner.input_batch.all_greedy = True
@@ -428,8 +434,12 @@ class TestRunnerIntegration:
     ):
         runner = object.__new__(TPUModelRunner)
         runner.num_reqs_paddings = [8, 16]
-        runner.speculative_config = spec
-        runner.scheduler_config = SimpleNamespace(async_scheduling=async_scheduling)
+        runner._repetition_penalty = rep_pen.RepetitionPenaltyTracker(
+            vocab_size=12,
+            max_num_reqs=16,
+            async_scheduling=async_scheduling,
+            speculative_decoding=spec is not None,
+        )
         runner.device = torch.device("cpu")
         runner._dummy_logits = lambda n: torch.zeros(n, 12, dtype=torch.bfloat16)
         runner._precompile_timed = MagicMock()

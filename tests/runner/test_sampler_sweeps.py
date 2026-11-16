@@ -54,14 +54,11 @@ def _runner(seen):
         gather_logprobs=lambda logits, ids: SimpleNamespace(logprobs=logits),
         structured_decoding_manager=manager,
         speculative_config=None,
-        scheduler_config=SimpleNamespace(async_scheduling=False),
+        _repetition_penalty=SimpleNamespace(supported=True),
     )
     # The real helper; without a speculative config it yields no verify rows.
     runner._verify_logits_paddings = types.MethodType(
         TPUModelRunner._verify_logits_paddings, runner
-    )
-    runner._repetition_penalty_supported = types.MethodType(
-        TPUModelRunner._repetition_penalty_supported, runner
     )
     return runner
 
