@@ -36,7 +36,7 @@ from vllm.sampling_params import StructuredOutputsParams
 
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
 from vllm_torchtpu.lora.torch_punica_tpu import PunicaWrapperTPU
-from vllm_torchtpu.runner import greedy_top_tokens, min_tokens, repetition_penalty
+from vllm_torchtpu.runner import greedy_top_tokens, min_tokens
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 
@@ -213,6 +213,7 @@ def _batch(*params, max_num_logprobs=None):
         max_num_logprobs=max_num_logprobs,
         req_ids=[*requests, None],
         req_id_to_index={r: i for i, r in enumerate(requests)},
+        repetition_penalties_reqs=set(),
     )
     return input_batch, requests
 
@@ -270,7 +271,6 @@ def _runner(weight, speculative_config=None):
     runner._greedy_head_owner = owner
     runner.speculative_config = speculative_config
     runner._min_tokens = min_tokens.MinTokensTracker()
-    runner._repetition_penalty = repetition_penalty.RepetitionPenaltyTracker()
     return runner
 
 

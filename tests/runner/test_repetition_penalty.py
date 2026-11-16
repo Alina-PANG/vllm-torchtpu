@@ -26,9 +26,8 @@ from vllm import SamplingParams
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
-from vllm_torchtpu.runner import min_tokens
+from vllm_torchtpu.runner import greedy_top_tokens, min_tokens
 from vllm_torchtpu.runner import repetition_penalty as rep_pen
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import AsyncTPUCopyState
@@ -58,83 +57,112 @@ def eager():
         yield
 
 
-class TestTracker:
-    def test_tracks_only_non_unit_repetition_penalty_and_accepts_ndarray_prompt(self):
-        tracker = rep_pen.RepetitionPenaltyTracker()
-        tracker.add(
-            "a",
-            SamplingParams(repetition_penalty=1.05),
-            np.array([1, 3, 31], dtype=np.int32),
-        )
-        tracker.add("b", SamplingParams(repetition_penalty=1.0), [2])
-        tracker.add("c", None, [4])
-        assert list(tracker.requests) == ["a"]
-        assert tracker.requests["a"].penalty == pytest.approx(1.05)
-        assert tracker.requests["a"].prompt_ids.tolist() == [1, 3, 31]
+def _batch(rows: dict[str, tuple[float, list[int]]], order: list[str]):
+    """An ``InputBatch`` stand-in: ``order`` gives the batch rows and ``rows``
+    maps a request id to its ``(repetition_penalty, output_token_ids)``."""
+    return SimpleNamespace(
+        req_ids=list(order),
+        req_id_to_index={r: i for i, r in enumerate(order)},
+        repetition_penalties_reqs={r for r in order if rows[r][0] != 1.0},
+        repetition_penalties_cpu=np.array([rows[r][0] for r in order], np.float32),
+        req_output_token_ids=[rows[r][1] for r in order],
+    )
 
-    def test_incremental_seen_bitmask_and_rollback_and_out_of_range_ids(self):
-        tracker = rep_pen.RepetitionPenaltyTracker()
+
+class TestSeenTokenBitmask:
+    def test_incremental_update_rollback_and_out_of_range_ids(self):
+        seen = rep_pen.SeenTokenBitmask()
         # Includes -1 (MM placeholder), 31 (sign bit of word 0), and 151645 (OOB).
-        tracker.add(
-            "a",
-            SamplingParams(repetition_penalty=1.2),
-            [-1, 2, 5, 31, 151645],
-        )
-        entry = tracker.requests["a"]
+        prompt = [-1, 2, 5, 31, 151645]
+        output: list[int] = []
 
         # Prefill: only in-range prompt ids [2, 5, 31] marked.
-        m0 = entry.seen_bitmask([], vocab_size=64)
+        m0 = seen.update(prompt, output, vocab_size=64)
         assert _unpack_bits(m0, 64) == [2, 5, 31]
 
         # Incremental decode update (+ out-of-range ignored + bit 63 sign bit).
-        m1 = entry.seen_bitmask([6, 63, 999], vocab_size=64)
+        output += [6, 63, 999]
+        m1 = seen.update(prompt, output, vocab_size=64)
         assert _unpack_bits(m1, 64) == [2, 5, 6, 31, 63]
 
         # Additional output tokens update in place without reallocating.
-        m2 = entry.seen_bitmask([6, 63, 999] + [1] * 10, vocab_size=64)
+        output += [1] * 10
+        m2 = seen.update(prompt, output, vocab_size=64)
         assert m2 is m1
         assert _unpack_bits(m2, 64) == [1, 2, 5, 6, 31, 63]
 
         # Shrunk output (rollback) zeroes and rebuilds in place from prompt + output.
-        m3 = entry.seen_bitmask([7], vocab_size=64)
+        del output[1:]
+        m3 = seen.update(prompt, output, vocab_size=64)
         assert m3 is m1
-        assert _unpack_bits(m3, 64) == [2, 5, 7, 31]
+        assert _unpack_bits(m3, 64) == [2, 5, 6, 31]
 
-    def test_preempted_kept_and_gone_evicted_and_staging_buffer_reused(self):
+    def test_new_prompt_or_output_list_rebuilds(self):
+        """A streaming-input continuation, or a finished id sent again, gives
+        the request new lists; the old bits must not leak into the new ones."""
+        seen = rep_pen.SeenTokenBitmask()
+        output = [7]
+        assert _unpack_bits(seen.update([2], output, 16), 16) == [2, 7]
+        # Same output list, new prompt (streaming continuation keeps the list).
+        output.clear()
+        assert _unpack_bits(seen.update([2, 9], output, 16), 16) == [2, 9]
+        # New output list object with the same length.
+        assert _unpack_bits(seen.update([2, 9], [], 16), 16) == [2, 9]
+        assert _unpack_bits(seen.update(None, [4], 16), 16) == [4]
+
+    def test_numpy_prompt_ids(self):
+        seen = rep_pen.SeenTokenBitmask()
+        prompt = np.array([1, 3, 31], dtype=np.int32)
+        assert _unpack_bits(seen.update(prompt, [], 32), 32) == [1, 3, 31]
+
+
+class TestTracker:
+    def test_reads_rows_penalties_and_outputs_from_the_batch(self):
         tracker = rep_pen.RepetitionPenaltyTracker()
-        tracker.add("keep", SamplingParams(repetition_penalty=1.1), [1])
-        tracker.add("gone", SamplingParams(repetition_penalty=1.1), [2])
-
-        def lookup(req_id: str):
-            return [3] if req_id == "keep" else None
-
-        # "keep" is temporarily absent from req_id_to_index (preempted).
-        assert tracker.batch_state({}, lookup) == {}
-        assert list(tracker.requests) == ["keep"]
-        state = tracker.batch_state({"keep": 1}, lookup)
-        assert list(state) == [1]
-
-        inputs1 = tracker.build_plain_inputs(
-            state, start=0, end=2, num_rows=4, vocab_size=64
+        requests = {
+            "a": SimpleNamespace(prompt_token_ids=[1]),
+            "b": SimpleNamespace(prompt_token_ids=[2]),
+        }
+        rows = {"a": (1.1, [3]), "b": (1.0, [4])}
+        # Row 0 ("b") has no penalty; row 1 ("a") does.
+        inputs = tracker.build_plain_inputs(
+            _batch(rows, ["b", "a"]), requests, 0, 2, num_rows=4, vocab_size=64
         )
-        assert inputs1 is not None
-        bm1, pen1 = inputs1
-        assert _unpack_bits(bm1[1], 64) == [1, 3]
-        assert pen1[1, 0] == pytest.approx(1.1)
-        assert pen1[0, 0] == pytest.approx(1.0)
+        assert inputs is not None
+        bitmask, penalties = inputs
+        assert _unpack_bits(bitmask[1], 64) == [1, 3]
+        assert _unpack_bits(bitmask[0], 64) == []
+        assert penalties[:, 0].tolist() == pytest.approx([1.0, 1.1, 1.0, 1.0])
 
-        # Next step moves "keep" to row 0: row 1 is cleaned in the reused buffer.
-        state2 = tracker.batch_state({"keep": 0}, lookup)
+        # The next step moves "a" to row 0: row 1 is cleared in the reused buffer.
         inputs2 = tracker.build_plain_inputs(
-            state2, start=0, end=2, num_rows=4, vocab_size=64
+            _batch(rows, ["a", "b"]), requests, 0, 2, num_rows=4, vocab_size=64
         )
         assert inputs2 is not None
-        bm2, pen2 = inputs2
-        assert bm2 is bm1 and pen2 is pen1
-        assert _unpack_bits(bm2[0], 64) == [1, 3]
-        assert _unpack_bits(bm2[1], 64) == []
-        assert pen2[0, 0] == pytest.approx(1.1)
-        assert pen2[1, 0] == pytest.approx(1.0)
+        bitmask2, penalties2 = inputs2
+        assert bitmask2 is bitmask and penalties2 is penalties
+        assert _unpack_bits(bitmask2[0], 64) == [1, 3]
+        assert _unpack_bits(bitmask2[1], 64) == []
+        assert penalties2[:, 0].tolist() == pytest.approx([1.1, 1.0, 1.0, 1.0])
+
+        # A chunk without a penalized row stages nothing.
+        assert (
+            tracker.build_plain_inputs(
+                _batch(rows, ["a", "b"]), requests, 1, 2, num_rows=4, vocab_size=64
+            )
+            is None
+        )
+
+    def test_prune_drops_requests_that_left_the_penalized_set(self):
+        tracker = rep_pen.RepetitionPenaltyTracker()
+        requests = {r: SimpleNamespace(prompt_token_ids=[1]) for r in "ab"}
+        rows = {"a": (1.1, []), "b": (1.2, [])}
+        tracker.build_plain_inputs(
+            _batch(rows, ["a", "b"]), requests, 0, 2, num_rows=2, vocab_size=8
+        )
+        assert sorted(tracker._seen) == ["a", "b"]
+        tracker.prune({"b"})
+        assert sorted(tracker._seen) == ["b"]
 
 
 @pytest.mark.usefixtures("eager")
@@ -204,6 +232,9 @@ def _plain_runner(logits: torch.Tensor, async_scheduling: bool = False, spec=Non
             all_greedy=True,
             num_tokens_no_spec=[2],
             token_ids_cpu=np.zeros((1, 16), dtype=np.int32),
+            repetition_penalties_reqs=set(),
+            repetition_penalties_cpu=np.ones(1, dtype=np.float32),
+            req_output_token_ids=[],
         ),
         requests={
             "r0": SimpleNamespace(
@@ -236,13 +267,15 @@ def _plain_runner(logits: torch.Tensor, async_scheduling: bool = False, spec=Non
         _stage_timing=MagicMock(),
     )
     runner._stage_timing.take_samples.return_value = ([], [])
+    runner.input_batch.req_output_token_ids.append(
+        runner.requests["r0"].output_token_ids
+    )
     for name in (
         "_apply_repetition_penalty_plain",
-        "_lookup_repetition_penalty_output",
         "_mask_min_tokens",
         "_min_tokens_batch_state",
         "_num_output_tokens",
-        "_repetition_penalty_batch_state",
+        "_repetition_penalty_active",
         "_repetition_penalty_supported",
         "_settle_draft_placeholders_for_min_tokens",
         "_warn_repetition_penalty_unsupported",
@@ -281,9 +314,8 @@ class TestRunnerIntegration:
         logits = torch.zeros(1, 8)
         logits[0, 4], logits[0, 2] = 3.0, 2.5
         runner = _plain_runner(logits)
-        runner._repetition_penalty.add(
-            "r0", SamplingParams(repetition_penalty=1.5), [4]
-        )
+        runner.input_batch.repetition_penalties_reqs.add("r0")
+        runner.input_batch.repetition_penalties_cpu[0] = 1.5
         runner.input_batch.max_num_logprobs = 0
         seen_logprob_logits: list[torch.Tensor] = []
 
@@ -344,12 +376,12 @@ class TestRunnerIntegration:
         runner._greedy_head_owner = object()
         runner._min_tokens = min_tokens.MinTokensTracker()
         runner._repetition_penalty = rep_pen.RepetitionPenaltyTracker()
-        runner._repetition_penalty.add("a", a.sampling_params, a.prompt_token_ids)
 
+        assert batch.repetition_penalties_reqs == {"a"}
         assert not runner._greedy_top_tokens_this_step()
-        state = runner._repetition_penalty_batch_state()
+        assert runner._repetition_penalty_active()
         logits = torch.full((4, 16), 2.0)
-        out = runner._apply_repetition_penalty_plain(logits, 0, 2, state)
+        out = runner._apply_repetition_penalty_plain(logits, 0, 2)
         # Row 0 ("b") untouched; row 1 ("a") scaled at tokens 3 and 5.
         assert torch.equal(out[0], logits[0])
         assert out[1, 3].item() == pytest.approx(1.0)
@@ -359,95 +391,22 @@ class TestRunnerIntegration:
     @pytest.mark.parametrize(
         ("async_scheduling", "spec"), [(True, None), (False, object())]
     )
-    def test_update_states_tracks_supported_and_skips_unsupported_requests(
-        self, async_scheduling, spec
-    ):
-        runner = object.__new__(TPUModelRunner)
-        runner._min_tokens = min_tokens.MinTokensTracker()
-        runner._repetition_penalty = rep_pen.RepetitionPenaltyTracker()
-        runner._mamba_state_pos, runner._mamba_slot_by_req_id = {}, {}
-        runner._free_mamba_slots, runner._mamba_offset_seeded = [], set()
-        runner._pre_async_results = None
-        runner.scheduler_config = SimpleNamespace(async_scheduling=False)
-        runner.speculative_config = None
-        runner.requests = {
-            "new": SimpleNamespace(prompt_token_ids=[2, 4]),
-        }
-        runner._install_spec_token_room_guard = lambda: None
-        new_req = SimpleNamespace(
-            req_id="new",
-            sampling_params=SamplingParams(repetition_penalty=1.1),
-        )
-        so = SimpleNamespace(
-            finished_req_ids=set(),
-            preempted_req_ids=None,
-            scheduled_cached_reqs=SimpleNamespace(resumed_req_ids=set()),
-            kv_cache_block_copies=None,
-            scheduled_new_reqs=[new_req],
-        )
-        with patch.object(GPUModelRunner, "_update_states", return_value=None):
-            TPUModelRunner._update_states(runner, so)
-        assert list(runner._repetition_penalty.requests) == ["new"]
-        so.scheduled_new_reqs = []
-        so.finished_req_ids = {"new"}
-        with patch.object(GPUModelRunner, "_update_states", return_value=None):
-            TPUModelRunner._update_states(runner, so)
-        assert not runner._repetition_penalty
-
-        # An unsupported mode logs warning_once and does not track the request,
-        # so the greedy top-tokens fast path stays open.
+    def test_unsupported_modes_skip_penalty_with_warning(self, async_scheduling, spec):
+        """An unsupported mode logs warning_once, applies nothing and keeps the
+        greedy top-tokens fast path open."""
+        runner = _plain_runner(torch.zeros(1, 8))
         runner.scheduler_config = SimpleNamespace(async_scheduling=async_scheduling)
         runner.speculative_config = spec
-        so.finished_req_ids = set()
-        so.scheduled_new_reqs = [new_req]
-        with (
-            patch.object(GPUModelRunner, "_update_states", return_value=None),
-            patch("vllm_torchtpu.runner.tpu_runner.logger") as log,
-        ):
-            TPUModelRunner._update_states(runner, so)
-        assert not runner._repetition_penalty
+        runner.input_batch.repetition_penalties_reqs.add("r0")
+        runner.input_batch.repetition_penalties_cpu[0] = 1.5
+        with patch("vllm_torchtpu.runner.tpu_runner.logger") as log:
+            assert not runner._repetition_penalty_active()
         log.warning_once.assert_called_once()
         assert "async_scheduling=False" in log.warning_once.call_args.args[0]
-
-    def test_update_states_retracks_streaming_continuation(self):
-        """A streaming-input continuation arrives as a new request with the
-        same id, a new prompt and new params, and no finish in between."""
-        runner = object.__new__(TPUModelRunner)
-        runner._min_tokens = min_tokens.MinTokensTracker()
-        runner._repetition_penalty = rep_pen.RepetitionPenaltyTracker()
-        runner._mamba_state_pos, runner._mamba_slot_by_req_id = {}, {}
-        runner._free_mamba_slots, runner._mamba_offset_seeded = [], set()
-        runner._pre_async_results = None
-        runner.scheduler_config = SimpleNamespace(async_scheduling=False)
-        runner.speculative_config = None
-        runner._install_spec_token_room_guard = lambda: None
-        runner._repetition_penalty.add("s", SamplingParams(repetition_penalty=1.5), [2])
-
-        def step(penalty, prompt_ids):
-            runner.requests = {"s": SimpleNamespace(prompt_token_ids=prompt_ids)}
-            so = SimpleNamespace(
-                finished_req_ids=set(),
-                preempted_req_ids=None,
-                scheduled_cached_reqs=SimpleNamespace(resumed_req_ids=set()),
-                kv_cache_block_copies=None,
-                scheduled_new_reqs=[
-                    SimpleNamespace(
-                        req_id="s",
-                        sampling_params=SamplingParams(repetition_penalty=penalty),
-                    )
-                ],
-            )
-            with patch.object(GPUModelRunner, "_update_states", return_value=None):
-                TPUModelRunner._update_states(runner, so)
-
-        # New params and prompt replace the old entry.
-        step(1.2, [2, 9, 4])
-        entry = runner._repetition_penalty.requests["s"]
-        assert entry.penalty == pytest.approx(1.2)
-        assert entry.prompt_ids.tolist() == [2, 9, 4]
-        # A continuation without a penalty drops the old entry.
-        step(1.0, [2, 9, 4, 7])
-        assert not runner._repetition_penalty
+        runner.input_batch.all_greedy = True
+        runner._greedy_head_owner = object()
+        with patch.object(greedy_top_tokens, "step_eligible", return_value=True):
+            assert TPUModelRunner._greedy_top_tokens_this_step(runner)
 
     @pytest.mark.parametrize(
         ("async_scheduling", "spec", "expected"),

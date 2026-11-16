@@ -2835,22 +2835,8 @@ class TPUModelRunner(GPUModelRunner):
         )
         result = super()._update_states(base_output)
         self._min_tokens.discard(scheduler_output.finished_req_ids)
-        self._repetition_penalty.discard(scheduler_output.finished_req_ids)
         for new_req in scheduler_output.scheduled_new_reqs:
             self._min_tokens.add(new_req.req_id, new_req.sampling_params)
-            # A streaming-input continuation reuses its request id with new
-            # params and a new prompt, so drop the old entry first.
-            self._repetition_penalty.discard((new_req.req_id,))
-            params = new_req.sampling_params
-            if params is None or params.repetition_penalty == 1.0:
-                continue
-            if not self._repetition_penalty_supported():
-                self._warn_repetition_penalty_unsupported()
-                continue
-            # The base _update_states above put every new request (new or
-            # streaming continuation) in self.requests.
-            prompt_ids = self.requests[new_req.req_id].prompt_token_ids
-            self._repetition_penalty.add(new_req.req_id, params, prompt_ids)
         # Copy after the base zeroes new blocks (the CoW dst is one of them).
         if use_page_local_copy:
             self._apply_kv_cache_block_copies(copies)
@@ -4980,20 +4966,16 @@ class TPUModelRunner(GPUModelRunner):
             "to apply it."
         )
 
-    def _repetition_penalty_batch_state(
-        self,
-    ) -> repetition_penalty_ops.RepetitionPenaltyState:
-        """This step's batch rows with ``repetition_penalty != 1.0``.
-
-        Requests are tracked only when ``_repetition_penalty_supported()``, so
-        an unsupported mode always sees an empty tracker here.
-        """
-        if not self._repetition_penalty:
-            return {}
-        return self._repetition_penalty.batch_state(
-            self.input_batch.req_id_to_index,
-            self._lookup_repetition_penalty_output,
-        )
+    def _repetition_penalty_active(self) -> bool:
+        """Whether this step applies ``repetition_penalty`` to some row."""
+        penalized = self.input_batch.repetition_penalties_reqs
+        if not penalized:
+            return False
+        if not self._repetition_penalty_supported():
+            self._warn_repetition_penalty_unsupported()
+            return False
+        self._repetition_penalty.prune(penalized)
+        return True
 
     def _repetition_penalty_supported(self) -> bool:
         """Whether this runner mode applies ``repetition_penalty``."""
@@ -5002,23 +4984,16 @@ class TPUModelRunner(GPUModelRunner):
             and self.speculative_config is None
         )
 
-    def _lookup_repetition_penalty_output(self, req_id: str) -> Sequence[int] | None:
-        req_state = self.requests.get(req_id)
-        if req_state is None:
-            return None
-        return req_state.output_token_ids
-
     def _apply_repetition_penalty_plain(
-        self,
-        logits: torch.Tensor,
-        start: int,
-        end: int,
-        rep_pen: repetition_penalty_ops.RepetitionPenaltyState,
+        self, logits: torch.Tensor, start: int, end: int
     ) -> torch.Tensor:
-        if not rep_pen:
-            return logits
         inputs = self._repetition_penalty.build_plain_inputs(
-            rep_pen, start, end, logits.shape[0], logits.shape[1]
+            self.input_batch,
+            self.requests,
+            start,
+            end,
+            logits.shape[0],
+            logits.shape[1],
         )
         if inputs is None:
             return logits
@@ -5212,7 +5187,7 @@ class TPUModelRunner(GPUModelRunner):
         state = self.execute_model_state
         scheduler_output = state.scheduler_output
         self.execute_model_state = None
-        rep_pen = self._repetition_penalty_batch_state()
+        rep_pen = self._repetition_penalty_active()
         min_toks = self._min_tokens_batch_state()
 
         # Used to keep rand draws consistent across TP ranks.
@@ -5431,7 +5406,7 @@ class TPUModelRunner(GPUModelRunner):
                     )
                 if rep_pen and not state.top_tokens:
                     logits = self._apply_repetition_penalty_plain(
-                        logits, cur_start_idx, cur_end_idx, rep_pen
+                        logits, cur_start_idx, cur_end_idx
                     )
                 with self._stage_timing.stage("sample"):
                     if state.top_tokens:
@@ -9015,7 +8990,10 @@ class TPUModelRunner(GPUModelRunner):
             self._greedy_head_owner is not None
             and greedy_top_tokens.step_eligible(self.input_batch, self.requests)
             and not self._min_tokens.any_in(self.input_batch.req_id_to_index)
-            and not self._repetition_penalty.any_in(self.input_batch.req_id_to_index)
+            and not (
+                self.input_batch.repetition_penalties_reqs
+                and self._repetition_penalty_supported()
+            )
         )
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
