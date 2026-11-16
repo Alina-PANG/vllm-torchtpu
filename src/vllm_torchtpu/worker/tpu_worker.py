@@ -224,6 +224,8 @@ class TPUWorker(WorkerBase):
         # takes these at construction time.
         self.profile_rank = binding.rank
         self.profile_world_size = binding.world_size
+        self._raiden_dp_rank = int(binding.dp_rank)
+        self._raiden_dp_size = int(binding.dp_size)
         if dp_size > 1:
             per_engine_world = pc.world_size
             dp_rank = binding.dp_rank
@@ -944,6 +946,112 @@ class TPUWorker(WorkerBase):
             transpose_keys=transpose_keys,
             reshard_fn=reshard_fn,
         )
+
+    _raiden_rl_weight_sync: Any = None
+    _raiden_dp_rank: int = 0
+    _raiden_dp_size: int = 1
+    _weight_update_active: bool = False
+
+    def init_weight_transfer_engine(self, init_info: dict[str, Any]) -> None:
+        """Initialize Raiden weight transfer in-process via vLLM's RL hook."""
+        info = init_info or {}
+        self.bind_raiden_sync(
+            worker_index=int(info.get("worker_index", 0)),
+            parallelism=int(info.get("parallelism", 4)),
+            job_name=str(info.get("job_name", "rollout")),
+        )
+
+    def start_weight_update(self, free_kv_cache: bool = True) -> None:
+        """Open an in-place RL weight update session."""
+        if self._weight_update_active:
+            raise RuntimeError(
+                "start_weight_update called while an update is already active; "
+                "call finish_weight_update first."
+            )
+        if free_kv_cache:
+            logger.info_once(
+                "[raiden_sync] Keeping TPU KV cache allocated during in-place "
+                "weight update (free_kv_cache=True ignored)."
+            )
+        self._weight_update_active = True
+
+    def update_weights(self, update_info: dict[str, Any]) -> None:
+        """No-op: Raiden's transport lands weight updates out of band."""
+        del update_info
+
+    def finish_weight_update(self) -> None:
+        """Close the active RL weight update session."""
+        self._weight_update_active = False
+
+    def _require_raiden_sync(self, op: str) -> Any:
+        sync = self._raiden_rl_weight_sync
+        if sync is None:
+            raise RuntimeError(f"bind_raiden_sync must run before {op}.")
+        return sync
+
+    def bind_raiden_sync(
+        self,
+        worker_index: int = 0,
+        parallelism: int = 4,
+        job_name: str = "rollout",
+        auto_h2d: bool | None = None,
+    ) -> dict[str, Any]:
+        """Bind live TPU model parameters on this worker to Raiden."""
+        from vllm_torchtpu.rl import raiden_worker_sync
+
+        model = self.model_runner.get_model()
+        tp_rank = int(get_tensor_model_parallel_rank())
+        tp_size = int(self.parallel_config.tensor_parallel_size)
+        dp_size = max(
+            int(self._raiden_dp_size),
+            int(utils.get_dp_size(self.parallel_config)),
+        )
+        dp_rank = (
+            int(self._raiden_dp_rank)
+            if self._raiden_dp_size > 1
+            else int(self.parallel_config.data_parallel_rank)
+        )
+        if self._raiden_rl_weight_sync is None:
+            self._raiden_rl_weight_sync = raiden_worker_sync.RaidenWorkerSync(
+                job_name=job_name,
+                worker_index=int(worker_index),
+                tp_rank=tp_rank,
+                tp_size=tp_size,
+                dp_rank=dp_rank,
+                dp_size=dp_size,
+                parallelism=int(parallelism),
+                auto_h2d=auto_h2d,
+            )
+        else:
+            self._raiden_rl_weight_sync.job_name = job_name
+            self._raiden_rl_weight_sync.worker_index = int(worker_index)
+            self._raiden_rl_weight_sync.dp_rank = dp_rank
+            self._raiden_rl_weight_sync.dp_size = dp_size
+        self._raiden_rl_weight_sync.bind(model, auto_h2d=auto_h2d)
+        if envs.VERIFY_WEIGHTS:
+            logger.info_once(
+                "[raiden_sync] Bound variables:\n%s",
+                self._raiden_rl_weight_sync.describe(),
+            )
+        return self._raiden_rl_weight_sync.metadata_dict()
+
+    def refresh_model_state_leaves(self) -> None:
+        """No-op on PyTorch; Raiden H2D updates parameter storage in place."""
+
+    def get_raiden_metadata(self) -> dict[str, Any]:
+        return self._require_raiden_sync("get_raiden_metadata").metadata_dict()
+
+    def raiden_h2d(self, uuid: int | None = None) -> dict[str, float | int]:
+        """Wait for transfer completion and synchronize H2D copies."""
+        sync = self._require_raiden_sync("raiden_h2d")
+        sync.h2d(uuid=uuid)
+        return sync.checksums() if envs.VERIFY_WEIGHTS else {}
+
+    def raiden_metrics(self) -> dict[str, Any]:
+        return self._require_raiden_sync("raiden_metrics").metrics()
+
+    def raiden_describe(self) -> str:
+        return self._require_raiden_sync("raiden_describe").describe()
 
     def get_kv_connector_handshake_metadata(self) -> dict | None:
         if not has_kv_transfer_group():

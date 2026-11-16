@@ -775,6 +775,69 @@ if __name__ == "__mp_main__":
     EngineCoreProc.__init__ = _engine_init
 
 
+class TestRaidenRLWeightSync:
+    """Verify TPUWorker's Raiden RL weight sync hooks and DP rank preservation."""
+
+    def test_bind_raiden_sync_uses_saved_dp_rank_when_collapsed(self):
+        cfg = _make_vllm_config()
+        cfg.parallel_config.tensor_parallel_size = 4
+        cfg.parallel_config.data_parallel_size = 1
+        cfg.parallel_config.data_parallel_rank = 0
+        worker = _build_worker(cfg)
+        worker._raiden_dp_rank = 1
+        worker._raiden_dp_size = 2
+        worker.model_runner = MagicMock()
+        fake_model = MagicMock()
+        worker.model_runner.get_model.return_value = fake_model
+
+        fake_sync_instance = MagicMock()
+        fake_sync_instance.metadata_dict.return_value = {
+            "unit": {"job_replica_id": "6"}
+        }
+        fake_sync_instance.checksums.return_value = {"__grand_total__": 42.0}
+
+        with (
+            patch(
+                "vllm_torchtpu.worker.tpu_worker.get_tensor_model_parallel_rank",
+                return_value=2,
+            ),
+            patch(
+                "vllm_torchtpu.rl.raiden_worker_sync.RaidenWorkerSync",
+                return_value=fake_sync_instance,
+            ) as mock_sync_cls,
+        ):
+            meta = worker.bind_raiden_sync(
+                worker_index=0, parallelism=8, job_name="replica_0"
+            )
+
+        mock_sync_cls.assert_called_once_with(
+            job_name="replica_0",
+            worker_index=0,
+            tp_rank=2,
+            tp_size=4,
+            dp_rank=1,
+            dp_size=2,
+            parallelism=8,
+            auto_h2d=None,
+        )
+        fake_sync_instance.bind.assert_called_once_with(fake_model, auto_h2d=None)
+        assert meta == {"unit": {"job_replica_id": "6"}}
+
+        worker.start_weight_update(free_kv_cache=True)
+        with pytest.raises(RuntimeError, match="already active"):
+            worker.start_weight_update()
+        worker.update_weights({"step": 1})
+        worker.finish_weight_update()
+
+        assert worker.raiden_h2d(uuid=5) == {}
+        fake_sync_instance.h2d.assert_called_once_with(uuid=5)
+        worker.refresh_model_state_leaves()
+
+        worker.model_runner._sync_weights = MagicMock(return_value=None)
+        worker.sync_weights([], {}, {})
+        worker.model_runner._sync_weights.assert_called_once()
+
+
 def _run_spawn_probes():
     patch_registry.apply("platform_activation")
     patch_registry._applied.add(_PARENT_MARKER)

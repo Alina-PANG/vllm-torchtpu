@@ -215,6 +215,11 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
     VLLM_TPU_SRPT_ATTN_WORK_CAP: int = 0
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
+    WEIGHT_SYNC_PARALLEL_H2H: bool = False
+    RAIDEN_PARALLELISM: int | None = None
+    TPU_RAIDEN_DATA_NICS: str = ""
+    RAIDEN_BIND_IP: str = ""
+    VERIFY_WEIGHTS: bool = False
 
 
 def env_with_choices(
@@ -1318,6 +1323,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_SRPT_ATTN_TILE_TOKENS": env_nonnegative_int(
         "VLLM_TPU_SRPT_ATTN_TILE_TOKENS", 32
     ),
+    # Enable explicit two-phase H2H + H2D Raiden RL weight synchronization.
+    "WEIGHT_SYNC_PARALLEL_H2H": env_bool("WEIGHT_SYNC_PARALLEL_H2H", default=False),
+    # Override number of parallel transfer streams per Raiden WeightSynchronizer.
+    "RAIDEN_PARALLELISM": env_optional_int("RAIDEN_PARALLELISM"),
+    # Comma-separated data NIC interface names for Raiden endpoint resolution.
+    "TPU_RAIDEN_DATA_NICS": env_str("TPU_RAIDEN_DATA_NICS", ""),
+    # Explicit bind/advertise IP address override for Raiden weight sync.
+    "RAIDEN_BIND_IP": env_str("RAIDEN_BIND_IP", ""),
+    # Log bound variable layouts and return L1 checksums after Raiden H2D sync.
+    "VERIFY_WEIGHTS": env_bool("VERIFY_WEIGHTS", default=False),
 }
 
 

@@ -116,6 +116,11 @@ Removed pipeline variables. Startup with pipeline parallelism fails while any of
 | `TPU_KV_RESHARD_TRANSPORT` | `"zmq"` | Transport protocol (`"zmq"` or `"tcp"`) for host-side KV resharding. |
 | `TPU_KV_TRANSFER_PORT` | `"9100"` | Port used by `TPUConnector` for KV cache transfer. |
 | `TPU_SIDE_CHANNEL_PORT` | `"9600"` | Port used by `TPUConnector` for side-channel handshake metadata. |
+| `WEIGHT_SYNC_PARALLEL_H2H` | `False` | Separates host-to-host Raiden weight transfer from the device H2D barrier (`auto_h2d=False`). |
+| `RAIDEN_PARALLELISM` | `None` | Overrides the parallel stream count used by RL `RaidenWorkerSync`. |
+| `TPU_RAIDEN_DATA_NICS` | `""` | Comma-separated network interface names striped across local Raiden worker endpoints. |
+| `RAIDEN_BIND_IP` | `""` | Explicit IP address bound and advertised by RL `RaidenWorkerSync`. |
+| `VERIFY_WEIGHTS` | `False` | Logs bound parameter layouts on bind and returns L1 checksums after `raiden_h2d`. |
 
 ---
 
