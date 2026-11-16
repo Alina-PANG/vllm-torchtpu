@@ -37,7 +37,9 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
+from vllm.utils.math_utils import cdiv
 
+from vllm_torchtpu.layers.adapter.sample.token_bitmask import unpack_token_bitmask
 from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
@@ -48,18 +50,13 @@ logger = init_logger(__name__)
 _BIT_MASKS: np.ndarray = (np.uint32(1) << np.arange(32, dtype=np.uint32)).view(np.int32)
 
 
-def num_bitmask_words(vocab_size: int) -> int:
-    """Number of 32-bit words needed to pack ``vocab_size`` token presence bits."""
-    return (vocab_size + 31) >> 5
-
-
 class SeenTokenBitmask:
     """Packed presence bits of one request's prompt and output ids, updated
     incrementally as the output grows."""
 
     def __init__(self, vocab_size: int) -> None:
         self._vocab_size = vocab_size
-        self._bitmask = np.zeros((num_bitmask_words(vocab_size),), dtype=np.int32)
+        self._bitmask = np.zeros((cdiv(vocab_size, 32),), dtype=np.int32)
         self._prompt_ids: Sequence[int] | None = None
         self._output_ids: Sequence[int] | None = None
         self._committed_len = 0
@@ -124,7 +121,7 @@ class RepetitionPenaltyTracker:
         self.supported = not async_scheduling and not speculative_decoding
         self._seen: dict[str, SeenTokenBitmask] = {}
         self._bitmask_buf = np.zeros(
-            (max_num_reqs, num_bitmask_words(vocab_size)), dtype=np.int32
+            (max_num_reqs, cdiv(vocab_size, 32)), dtype=np.int32
         )
         self._penalties_buf = np.ones((max_num_reqs, 1), dtype=np.float32)
         self._dirty_rows: list[int] = []
@@ -245,12 +242,8 @@ def _apply_repetition_penalty(
     """Unpack ``seen_bitmask`` (``[rows, cdiv(vocab_size, 32)]`` ``int32``) and
     scale ``logits`` in ``float32`` by ``1 / penalties`` where ``logits > 0`` and
     ``penalties`` otherwise on seen positions, preserving ``logits.dtype``."""
-    target_dim = logits.shape[-1]
     shifts = torch.arange(32, dtype=torch.int32, device=seen_bitmask.device)
-    seen_mask = (
-        torch.bitwise_right_shift(seen_bitmask[:, :, None], shifts[None, None, :]) & 1
-    ) != 0
-    seen_mask = seen_mask.reshape(logits.shape[0], -1)[:, :target_dim]
+    seen_mask = unpack_token_bitmask(seen_bitmask, shifts, logits.shape[-1])
     logits_f32 = logits.to(torch.float32)
     inv_penalties = 1.0 / penalties
     pos_scale = torch.where(logits_f32 > 0, inv_penalties, penalties)

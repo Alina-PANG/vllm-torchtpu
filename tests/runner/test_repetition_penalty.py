@@ -23,6 +23,7 @@ import numpy as np
 import pytest
 import torch
 from vllm import SamplingParams
+from vllm.utils.math_utils import cdiv
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
@@ -43,7 +44,7 @@ def _unpack_bits(bitmask: np.ndarray, vocab_size: int) -> list[int]:
 
 def _pack_bool_mask(seen_bool: np.ndarray) -> np.ndarray:
     num_rows, vocab_size = seen_bool.shape
-    num_words = rep_pen.num_bitmask_words(vocab_size)
+    num_words = cdiv(vocab_size, 32)
     out = np.zeros((num_rows, num_words), dtype=np.int32)
     for r in range(num_rows):
         for tok in np.where(seen_bool[r])[0]:

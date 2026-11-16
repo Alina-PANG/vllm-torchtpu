@@ -21,6 +21,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.utils.math_utils import cdiv
 
 from tests.runner.precompile_sweep_checks import ops_outside_aten as _ops_outside_aten
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import CANDIDATE_BLOCK
@@ -184,7 +185,7 @@ def test_rotated_sweeps_hold_no_collective():
     graphs += _trace(
         repetition_penalty.apply_repetition_penalty,
         logits,
-        torch.zeros(n, repetition_penalty.num_bitmask_words(vocab), dtype=torch.int32),
+        torch.zeros(n, cdiv(vocab, 32), dtype=torch.int32),
         torch.ones(n, 1),
     )
     assert [op for gm in graphs for op in _ops_outside_aten(gm)] == []

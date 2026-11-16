@@ -6844,7 +6844,7 @@ class TPUModelRunner(GPUModelRunner):
                 self.num_reqs_paddings, "repetition_penalty"
             ):
                 logits = self._dummy_logits(num_rows)
-                num_words = repetition_penalty_ops.num_bitmask_words(logits.shape[1])
+                num_words = cdiv(logits.shape[1], 32)
                 seen_bitmask = torch.zeros(
                     (num_rows, num_words), dtype=torch.int32, device=self.device
                 )
