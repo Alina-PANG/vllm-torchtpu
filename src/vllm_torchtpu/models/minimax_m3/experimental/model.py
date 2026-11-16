@@ -34,6 +34,7 @@ from vllm.model_executor.models.utils import (
 )
 
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.models.minimax_m3.experimental import plan
 from vllm_torchtpu.models.minimax_m3.experimental.attention import (
     MiniMaxM3SparseAttention,
 )
@@ -221,6 +222,13 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
+        # Shared-core hooks the model plan turns on (read by the runner after
+        # load_model): the Pallas TP all-reduce cap and the fused spec verify.
+        logger.info("MiniMax M3 model plan: %s", plan.resolve_plan(vllm_config))
+        self.tp_pallas_all_reduce_max_bytes = plan.selected(
+            vllm_config, "tp_all_reduce"
+        )
+        self.spec_verify_fused_sampler = plan.selected(vllm_config, "spec_verify")
         config = vllm_config.model_config.hf_text_config
         self.model = MiniMaxM3Model(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")

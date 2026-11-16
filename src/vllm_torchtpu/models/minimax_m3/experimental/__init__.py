@@ -24,6 +24,7 @@ _ARCHITECTURES = (
     # with the text-only model.
     "MiniMaxM3SparseForConditionalGeneration",
 )
+# Keep in sync with variants.VARIANTS["model"] / ["draft"] (test_plan checks).
 _MODEL = "vllm_torchtpu.models.minimax_m3.experimental.model:MiniMaxM3SparseForCausalLM"
 # The checkpoint's dspark/ draft; keep in sync with dspark.ARCHITECTURE.
 _DSPARK_ARCHITECTURE = "DSparkMiniMaxDraftModel"
@@ -37,6 +38,7 @@ def register() -> None:
     from vllm.model_executor.models import ModelRegistry
     from vllm.model_executor.models.config import MODELS_CONFIG_MAP
 
+    from vllm_torchtpu.core.dp_prefix_affinity import register_dp_prefix_affinity
     from vllm_torchtpu.distributed.dcp import (
         register_kv_head_spanning_dcp_architectures,
     )
@@ -45,6 +47,9 @@ def register() -> None:
         register_model_kv_cache_dtype,
     )
     from vllm_torchtpu.models.minimax_m3.experimental.hooks import TPUMiniMaxM3Config
+    from vllm_torchtpu.models.minimax_m3.experimental.plan import (
+        prefix_affinity_policy,
+    )
     from vllm_torchtpu.models.minimax_m3.experimental.quant import (
         QUANT_METHOD,
         MiniMaxM3QuantConfig,
@@ -71,3 +76,5 @@ def register() -> None:
         *_ARCHITECTURES,
         _DSPARK_ARCHITECTURE,
     )
+    # API-server routing across DP engines follows the plan's dp_routing slot.
+    register_dp_prefix_affinity(prefix_affinity_policy, *_ARCHITECTURES)
