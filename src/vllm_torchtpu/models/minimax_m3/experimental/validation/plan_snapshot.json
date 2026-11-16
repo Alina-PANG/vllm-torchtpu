@@ -1,0 +1,22 @@
+{
+ "agentx-tp8-ep-dcp-dspark": {
+  "config": {"tp": 8, "dp": 1, "ep": true, "spec": true},
+  "plan": {"model": "msa_sparse", "draft": "dspark", "tp_all_reduce": "pallas_512k", "spec_verify": "fused", "dp_routing": "load_balance"}
+ },
+ "tp8-ep-no-spec": {
+  "config": {"tp": 8, "dp": 1, "ep": true, "spec": false},
+  "plan": {"model": "msa_sparse", "draft": "dspark", "tp_all_reduce": "pallas_512k", "spec_verify": "unfused", "dp_routing": "load_balance"}
+ },
+ "tp8-no-ep-dspark": {
+  "config": {"tp": 8, "dp": 1, "ep": false, "spec": true},
+  "plan": {"model": "msa_sparse", "draft": "dspark", "tp_all_reduce": "xla", "spec_verify": "fused", "dp_routing": "load_balance"}
+ },
+ "tp4-dp2-ep-dspark": {
+  "config": {"tp": 4, "dp": 2, "ep": true, "spec": true},
+  "plan": {"model": "msa_sparse", "draft": "dspark", "tp_all_reduce": "xla", "spec_verify": "fused", "dp_routing": "load_balance"}
+ },
+ "tp4-dp2-ep-dspark-profile-tp4-dp2": {
+  "config": {"tp": 4, "dp": 2, "ep": true, "spec": true, "additional": {"model_plan": {"profile": "tp4-dp2"}}},
+  "plan": {"model": "msa_sparse", "draft": "dspark", "tp_all_reduce": "xla", "spec_verify": "fused", "dp_routing": "prefix_affinity"}
+ }
+}
