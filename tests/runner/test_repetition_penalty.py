@@ -170,6 +170,24 @@ class TestTracker:
             is None
         )
 
+    @pytest.mark.usefixtures("eager")
+    def test_chunks_scale_only_their_own_rows(self):
+        """A penalized request at batch index 3 is row 1 of chunk [2, 4) and
+        is not in chunk [0, 2)."""
+        tracker = _tracker(vocab_size=8)
+        order = ["r0", "r1", "r2", "r3"]
+        rows = {r: (1.0, []) for r in order}
+        rows["r3"] = (2.0, [5])
+        batch = _batch(rows, order)
+        requests = {r: SimpleNamespace(prompt_token_ids=[1]) for r in order}
+        logits = torch.full((2, 8), 4.0)
+
+        first = tracker.apply(logits, batch, requests, 0, 2)
+        second = tracker.apply(logits, batch, requests, 2, 4)
+        assert torch.equal(first, logits)
+        assert torch.equal(second[0], logits[0])
+        assert second[1].tolist() == [4.0, 2.0, 4.0, 4.0, 4.0, 2.0, 4.0, 4.0]
+
     def test_prune_drops_requests_that_left_the_penalized_set(self):
         tracker = _tracker(vocab_size=8)
         requests = {r: SimpleNamespace(prompt_token_ids=[1]) for r in "ab"}
@@ -212,14 +230,10 @@ class TestScalingMath:
         pen_np = penalties_1d.view(-1, 1).numpy()
         got = rep_pen.apply_penalties_table(logits, seen_bitmask_np, pen_np)
 
+        # Both sides scale in float32 and round once, so they match bit for bit.
         assert got.dtype == dtype
         assert torch.isneginf(got[1, 5])
-        torch.testing.assert_close(
-            got[~torch.isneginf(ref)],
-            ref[~torch.isneginf(ref)],
-            rtol=1e-2 if dtype == torch.bfloat16 else 1e-6,
-            atol=1e-2 if dtype == torch.bfloat16 else 1e-6,
-        )
+        assert torch.equal(got, ref)
 
 
 def _penalized_runner(logits: torch.Tensor, penalty: float = 1.5):
@@ -254,6 +268,83 @@ class TestRunnerIntegration:
         out = run_sample_tokens(runner)
         assert out.sampled_token_ids == [[2]]
         assert seen_logprob_logits[0][0, 4].item() == pytest.approx(3.0)
+
+    def test_random_sampling_uses_the_penalized_logits(self):
+        """Temperature 1 through the runner's own sampler. Without the penalty
+        token 4 (in the prompt) holds all but e^-20 of the mass; penalty 30
+        takes it from 30.0 to 1.0, so token 2 (10.0) holds all but e^-9."""
+        logits = torch.full((1, 8), NEG_INF)
+        logits[0, 4], logits[0, 2] = 30.0, 10.0
+        runner = _penalized_runner(logits, penalty=30.0)
+        runner.input_batch.all_greedy = False
+        runner._build_padded_sampling_params = lambda *_args: (
+            torch.ones((1, 1)),
+            torch.zeros((1, 1), dtype=torch.int32),
+            torch.ones((1, 1)),
+        )
+        runner._sampler_topk_candidates = lambda *_args: 0
+        runner._sampler_applies_topk_topp = (
+            TPUModelRunner._sampler_applies_topk_topp.__get__(runner)
+        )
+        runner._get_sampling_generator = lambda: torch.Generator().manual_seed(0)
+        runner._apply_temperature = TPUModelRunner._apply_temperature.__get__(runner)
+        runner.sample_from_logits_func = TPUModelRunner.sample_from_logits.__get__(
+            runner
+        )
+        assert run_sample_tokens(runner).sampled_token_ids == [[2]]
+
+    def test_multi_chunk_step_penalizes_the_request_in_the_second_chunk(self):
+        """Two logits chunks of 2 rows; the penalized request is batch index 3,
+        row 1 of the second chunk. The others pick token 4 unchanged."""
+        order = ["r0", "r1", "r2", "r3"]
+        chunk = torch.zeros(2, 8)
+        chunk[:, 4], chunk[:, 2] = 3.0, 2.5
+        runner = plain_step_runner(chunk)
+        st = runner.execute_model_state
+        st.logits_list = [chunk.clone(), chunk.clone()]
+        st.num_reqs_list = [2, 2]
+        st.spec_decode_metadata_list = [None, None]
+        st.scheduler_output.num_scheduled_tokens = dict.fromkeys(order, 1)
+        runner.requests = {
+            r: SimpleNamespace(
+                prompt_token_ids=[4],
+                num_computed_tokens=0,
+                num_tokens=1,
+                output_token_ids=[],
+            )
+            for r in order
+        }
+        batch = runner.input_batch
+        batch.num_reqs, batch.req_ids = 4, list(order)
+        batch.req_id_to_index = {r: i for i, r in enumerate(order)}
+        batch.num_tokens_no_spec = [1] * 4
+        batch.token_ids_cpu = np.zeros((4, 8), dtype=np.int32)
+        batch.req_output_token_ids = [
+            runner.requests[r].output_token_ids for r in order
+        ]
+        batch.repetition_penalties_cpu = np.array([1.0, 1.0, 1.0, 1.5], np.float32)
+        batch.repetition_penalties_reqs = {"r3"}
+        assert run_sample_tokens(runner).sampled_token_ids == [[4], [4], [4], [2]]
+
+    def test_min_tokens_and_repetition_penalty_in_one_step(self):
+        """Stop token 3 is masked below min_tokens, and the penalty takes token
+        4 (in the prompt) from 3.0 to 2.0, so token 2 (2.5) wins."""
+        logits = torch.zeros(1, 8)
+        logits[0, 3], logits[0, 4], logits[0, 2] = 4.0, 3.0, 2.5
+        runner = _penalized_runner(logits)
+        runner._min_tokens.add("r0", SamplingParams(min_tokens=4, stop_token_ids=[3]))
+        assert run_sample_tokens(runner).sampled_token_ids == [[2]]
+
+    def test_request_without_prompt_ids_is_penalized_on_its_outputs(self):
+        """A prompt-embeds request has no prompt_token_ids; only its output
+        ids count as seen."""
+        logits = torch.zeros(1, 8)
+        logits[0, 5], logits[0, 4], logits[0, 2] = 3.0, 2.8, 2.5
+        runner = _penalized_runner(logits)
+        runner.requests["r0"].prompt_token_ids = None
+        runner.requests["r0"].output_token_ids.append(5)
+        # Token 5 (an output) drops to 2.0; token 4 is not seen and wins.
+        assert run_sample_tokens(runner).sampled_token_ids == [[4]]
 
     def test_batch_reorder_and_top_tokens_gate(self):
         batch = InputBatch(
@@ -382,18 +473,63 @@ class TestRunnerIntegration:
         assert apply_calls == expected
 
 
+@pytest.mark.usefixtures("eager")
+def test_precompile_covers_the_calls_serving_makes():
+    """At every request bucket, the kernel call of a step with a penalized
+    row has the shapes and dtypes of a precompiled call (logits, bitmask and
+    penalties). Both sides take their logits from `_dummy_logits`."""
+    buckets = [8, 16]
+    runner = object.__new__(TPUModelRunner)
+    runner.num_reqs_paddings = buckets
+    runner._repetition_penalty = _tracker(vocab_size=40, max_num_reqs=16)
+    runner.device = torch.device("cpu")
+    runner._dummy_logits = lambda n: torch.zeros(n, 40, dtype=torch.bfloat16)
+    runner._precompile_timed = MagicMock()
+    calls = set()
+    orig_apply = rep_pen.apply_repetition_penalty
+
+    def spy_apply(logits, seen_bitmask, penalties):
+        calls.add(
+            (
+                tuple(logits.shape),
+                logits.dtype,
+                tuple(seen_bitmask.shape),
+                seen_bitmask.dtype,
+                tuple(penalties.shape),
+                penalties.dtype,
+            )
+        )
+        return orig_apply(logits, seen_bitmask, penalties)
+
+    with patch.object(rep_pen, "apply_repetition_penalty", side_effect=spy_apply):
+        runner._precompile_repetition_penalty()
+        precompiled, calls = calls, set()
+        rows = {"r0": (1.3, [7])}
+        for num_rows in buckets:
+            runner._repetition_penalty.apply(
+                runner._dummy_logits(num_rows),
+                _batch(rows, ["r0"]),
+                {"r0": SimpleNamespace(prompt_token_ids=[33])},
+                0,
+                1,
+            )
+    assert len(calls) == len(buckets)
+    assert calls <= precompiled
+
+
 @pytest.mark.tpu_test
-def test_compiled_repetition_penalty_on_tpu():
+@pytest.mark.parametrize("vocab_size", [512, 500])
+def test_compiled_repetition_penalty_on_tpu(vocab_size):
     import torch_tpu  # noqa: F401
 
     device = torch.device("tpu")
     gen = torch.Generator().manual_seed(7)
-    logits_cpu = torch.randn((8, 512), generator=gen, dtype=torch.bfloat16)
+    logits_cpu = torch.randn((8, vocab_size), generator=gen, dtype=torch.bfloat16)
     logits_cpu[0, 10] = NEG_INF
 
-    seen_bool = np.zeros((8, 512), dtype=np.bool_)
+    seen_bool = np.zeros((8, vocab_size), dtype=np.bool_)
     seen_bool[0, [3, 10, 31, 42]] = True
-    seen_bool[2, [100, 511]] = True
+    seen_bool[2, [100, vocab_size - 1]] = True
     seen_bitmask_np = _pack_bool_mask(seen_bool)
     penalties_np = np.ones((8, 1), dtype=np.float32)
     penalties_np[0, 0] = 1.05
