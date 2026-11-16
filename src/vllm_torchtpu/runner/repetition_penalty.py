@@ -28,6 +28,13 @@ multimodal placeholders are ignored). On device, the bitmask is unpacked and
 seen positions are scaled in ``float32`` by ``1 / penalty`` where
 ``logits > 0`` and ``penalty`` otherwise before casting back to
 ``logits.dtype``.
+
+Difference from vLLM: vLLM casts the logits to ``float32`` before the penalty
+and picks the token from ``float32``. Here the scaled logits go back to
+``logits.dtype`` (usually ``bfloat16``), the dtype the TPU sampler and its
+precompiled graphs take, so they are rounded a second time. Two logits closer
+than one ``bfloat16`` step (0.125 near 20) can then tie or swap, and the
+greedy token can differ from vLLM's.
 """
 
 from __future__ import annotations
