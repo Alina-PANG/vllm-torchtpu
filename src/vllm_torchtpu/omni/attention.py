@@ -24,7 +24,7 @@ from typing import Any
 
 import jax
 import torch
-from torch_tpu._internal import pallas
+from torch.tpu import pallas
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend, SDPAImpl
 
 from vllm_torchtpu.kernels.diffusion_attention.kernel import flash_attention_bshd

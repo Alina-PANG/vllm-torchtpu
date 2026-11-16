@@ -70,14 +70,13 @@ def _load_module(monkeypatch):
             "vllm_torchtpu.kernels",
             "vllm_torchtpu.kernels.deepseek_v4",
             "vllm_torchtpu.kernels.deepseek_v4.o_projection",
-            "torch_tpu",
-            "torch_tpu._internal",
+            "torch.tpu",
         )
     }
     o_projection = stubs["vllm_torchtpu.kernels.deepseek_v4.o_projection"]
     o_projection.O_FETCH_MAX_TOKENS = 512
     o_projection.fused_reverse_rope_wo_a_projection_o_fetch = None
-    stubs["torch_tpu._internal"].pallas = None
+    stubs["torch.tpu"].pallas = None
     attention = stubs["vllm_torchtpu.models.vllm.deepseek_v4.attention"]
     attention.VllmDeepseekV4MLAAttention = _FakeBaseAttention
     attention._pallas_op_cache = {}

@@ -19,7 +19,7 @@ from collections.abc import Callable
 from typing import Any
 
 import torch
-from torch_tpu._internal import pallas
+from torch.tpu import pallas
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
