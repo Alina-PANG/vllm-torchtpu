@@ -14,9 +14,7 @@
 """HF config for Ai2's OLMo 3.5 hybrid KDA / attention / latent-MoE models.
 
 transformers has no class for this architecture yet. The fields mirror the
-MaxText `decoder_block: olmoe3` configs (for example
-`olmo35-small-e256k8-sh2x.yml` on the `agagik-olmo35` branch); the defaults
-are OLMo 3.5 Small (72.6B total, 4.1B active).
+MaxText `decoder_block: olmoe3` configs; the defaults are OLMo 3.5 Small (72.6B total, 4.1B active).
 """
 
 from __future__ import annotations

@@ -19,10 +19,11 @@ Reads each parameter directly with TensorStore (no MaxText import), one shard
 per decoder layer plus one for embedding / final norm / LM head. Resumable:
 a shard is skipped when it already exists.
 
-Run on a CDK pod with /workspace/venv (tensorstore, torch, safetensors):
+Requires tensorstore, torch and safetensors (plus google-cloud-storage for a
+gs:// destination):
   python3 scripts/olmo35/convert_maxtext_to_hf.py \
-      --src gs://sierraqian/olmo35/checkpoints/162974/items \
-      --dst /workspace/models/olmo35-small
+      --src <maxtext_checkpoint>/<step>/items \
+      --dst <output_dir_or_gs_uri>
 """
 
 import argparse
@@ -61,8 +62,6 @@ def _spec(src: str, name: str) -> dict:
         kvstore = {"driver": "gcs", "bucket": bucket, "path": key}
     else:
         kvstore = {"driver": "file", "path": path}
-    # One chunk of the source checkpoint was repaired by hand; tolerate any
-    # other missing chunk as zeros only after logging (see _read).
     return {"driver": "zarr", "kvstore": kvstore}
 
 
@@ -194,8 +193,10 @@ def _publish(local_tmp: str, path: str) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--src", default="gs://sierraqian/olmo35/checkpoints/162974/items")
-    ap.add_argument("--dst", default="/workspace/models/olmo35-small")
+    ap.add_argument(
+        "--src", required=True, help="MaxText Orbax checkpoint items dir (local or gs://)"
+    )
+    ap.add_argument("--dst", required=True, help="output dir (local or gs://)")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--layers", default="", help="e.g. 0,1,7 for a partial run")
     args = ap.parse_args()

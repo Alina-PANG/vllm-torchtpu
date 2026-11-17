@@ -13,8 +13,8 @@
 # limitations under the License.
 """OLMo 3.5 (Ai2's hybrid KDA / attention / latent-MoE model) for TPU.
 
-Follows MaxText's `decoder_block: olmoe3` (`maxtext/models/olmoe3.py` on the
-`agagik-olmo35` branch), the training reference for the released checkpoints.
+Follows MaxText's `decoder_block: olmoe3` (`maxtext/models/olmoe3.py`), the
+training reference for the checkpoints.
 Per layer:
 
     h   = x + attn_out_norm(mixer(attn_in_norm(x)))
