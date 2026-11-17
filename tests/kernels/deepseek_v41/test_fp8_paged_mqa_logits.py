@@ -13,6 +13,7 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.cache import (
     quantize_index_rows,
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.dense_logits import (
+    _mask_unseen_pages,
     fp8_paged_mqa_logits,
 )
 
@@ -97,6 +98,70 @@ def test_paged_mqa_logits_matches_reference(page_size, max_model_len):
         np.testing.assert_allclose(
             actual[visible], expected[visible], rtol=2e-2, atol=2e-2 * expected.max()
         )
+
+
+def test_mask_unseen_pages_keeps_what_each_request_can_see():
+    """Entries past a request's longest context become invalid pages."""
+    page_ids = jnp.asarray(
+        [[5, 6, 7, 0, 0, 0], [9, 0, 0, 0, 0, 0], [3, 4, 0, 0, 0, 0]], jnp.int32
+    )
+    # Request 0 owns rows 0..2 and sees at most 300 keys: three 128-key pages.
+    # Request 1 owns no row. Request 2 owns rows 3 and 4 and sees 129 keys.
+    # The last row is padding past the last boundary.
+    context_lens = jnp.asarray([10, 300, 257, 129, 1, 0], jnp.int32)
+    query_start_loc = jnp.asarray([0, 3, 3, 5], jnp.int32)
+    masked = _mask_unseen_pages(page_ids, context_lens, query_start_loc, 128)
+    np.testing.assert_array_equal(
+        masked,
+        [[5, 6, 7, -1, -1, -1], [-1, -1, -1, -1, -1, -1], [3, 4, -1, -1, -1, -1]],
+    )
+
+
+@pytest.mark.parametrize(
+    "context", [300, 20000, 70000], ids=["one_page_tile", "partial_tile", "two_tiles"]
+)
+def test_masked_null_pages_score_like_invalid_pages(monkeypatch, context):
+    """Null-block entries past the context score as -1 entries do, bitwise."""
+    if jax.default_backend() != "tpu":
+        pytest.skip("Packed FP8 scoring requires TPU")
+    rng = np.random.default_rng(17)
+    page_size, max_model_len, tokens = 128, 98816, 12
+    per_request = -(-max_model_len // page_size)
+    layout = PackedFP8Layout(per_request + 1, page_size=page_size)
+    keys = jnp.asarray(rng.normal(size=(layout.pages * page_size, 128)), jnp.bfloat16)
+    pool, _ = _pack(keys, layout)
+    lengths = jnp.asarray(context + np.arange(tokens), jnp.int32)
+    live = -(-(context + tokens - 1) // page_size)
+    # Page 0 plays the null block: no request owns it.
+    table = 1 + rng.permutation(per_request)[None, :]
+    null_table, invalid_table = table.copy(), table.copy()
+    null_table[:, live:], invalid_table[:, live:] = 0, -1
+    q = jnp.asarray(rng.normal(size=(tokens, 32, 128)), jnp.float8_e4m3fn)
+    weights = jnp.asarray(rng.uniform(0.01, 0.1, (tokens, 32)), jnp.float32)
+
+    def score(table):
+        # A fresh trace reads the flag; the public entry point caches its own.
+        return jax.jit(
+            lambda table: fp8_paged_mqa_logits.__wrapped__(
+                q,
+                jnp.asarray(pool),
+                weights,
+                lengths,
+                table,
+                query_start_loc=jnp.asarray([0, tokens], jnp.int32),
+                max_model_len=max_model_len,
+                q_scale=jnp.ones_like(weights),
+                query_size=6,
+                cache_layout=layout,
+            )
+        )(jnp.asarray(table, jnp.int32))
+
+    expected = np.asarray(score(invalid_table))
+    monkeypatch.setenv("TPU_DEEPSEEK_V41_INDEXER_MASK_UNSEEN_PAGES", "1")
+    masked = np.asarray(score(null_table))
+    np.testing.assert_array_equal(masked, expected)
+    visible = np.arange(max_model_len)[None, :] < np.asarray(lengths)[:, None]
+    np.testing.assert_array_equal(np.isneginf(masked), ~visible)
 
 
 def _calc_diff(x, y):

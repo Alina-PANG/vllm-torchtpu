@@ -11,6 +11,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v41.csa2.cache import (
     encode_csa2_kv,
+    gather_csa2_kv_sc,
     prepare_swa_metadata,
 )
 from vllm_torchtpu.kernels.deepseek_v41.csa2.csa2 import csa2
@@ -108,7 +109,7 @@ def test_chunked_attention_preserves_requests_and_reusable_kv(
         jnp.take_along_axis(expected_scales, order, axis=1),
     )
 
-    def pipeline(chunk, deep_gather=False):
+    def pipeline(chunk, deep_gather=False, gather_padding="shared"):
         return csa2_pipeline(
             q,
             word_banks,
@@ -124,17 +125,20 @@ def test_chunked_attention_preserves_requests_and_reusable_kv(
             counts,
             chunk_size=chunk,
             deep_gather=deep_gather,
+            gather_padding=gather_padding,
             **kwargs,
         )
 
     output, gathered_words, gathered_scales = pipeline(chunk_size)
-    # The deep gather only changes staging: chunked and
-    # single-chunk results, including zeroed invalid rows, must be bitwise
-    # equal to the default.
+    # The deep gather only changes staging, and its padding variants only
+    # the source of the zeros: chunked and single-chunk results, including
+    # zeroed invalid rows, must be bitwise equal to the default.
     for chunk in (chunk_size, tokens):
         reference = pipeline(chunk)
-        for variant, default in zip(pipeline(chunk, deep_gather=True), reference):
-            np.testing.assert_array_equal(variant, default)
+        for padding in ("shared", "spread", "skip"):
+            variant = pipeline(chunk, deep_gather=True, gather_padding=padding)
+            for value, default in zip(variant, reference):
+                np.testing.assert_array_equal(value, default)
     np.testing.assert_allclose(output, expected, atol=2e-3, rtol=2e-2)
     np.testing.assert_array_equal(output[155:], 0)
     np.testing.assert_array_equal(gathered_words, expected_words)
@@ -319,6 +323,48 @@ def test_chunked_pipeline_writes_owners_without_joins(sparsecore_device):
         rf"= {owners}\S* (fusion|concatenate|dynamic-update-slice|copy)\(", text
     )
     assert not joins, joins
+
+
+@pytest.mark.parametrize("padding", ["shared", "spread", "skip"])
+@pytest.mark.parametrize("banked", [False, True], ids=["one_bank", "two_banks"])
+def test_deep_gather_zeroes_negative_records(sparsecore_device, banked, padding):
+    """Padding rows, short rows and scattered negative IDs all gather zeros."""
+    rng = np.random.default_rng(5)
+    latents = jnp.asarray(rng.standard_normal((257, 512)) * 0.2, jnp.bfloat16)
+    words, scales = encode_csa2_kv(latents)
+    counts = rng.integers(0, 513, (96, 1))
+    records = rng.integers(0, 257, (96, 512)).astype(np.int32)
+    records = np.where(np.arange(512) < counts, records, -1)
+    # Whole rows of padding, as the tail of a partly filled step.
+    records[8:40] = -1
+    # Negative IDs that are not a suffix: no stream of these rows is empty.
+    records[40:48, ::3] = -1
+    # A leading stream of padding ahead of valid records.
+    records[48:56, :16] = -1
+    records = jnp.asarray(records)
+    selected = jnp.maximum(records, 0)
+    expected_words = jnp.where(records[:, :, None] >= 0, words[selected], 0)
+    expected_scales = jnp.where(records >= 0, scales[selected], 0)
+    gathered_words, gathered_scales = gather_csa2_kv_sc(
+        (words[:113], words[113:]) if banked else words,
+        (scales[:113], scales[113:]) if banked else scales,
+        records,
+        deep=True,
+        padding=padding,
+    )
+    np.testing.assert_array_equal(gathered_words, expected_words)
+    np.testing.assert_array_equal(gathered_scales, expected_scales)
+
+
+def test_gather_rejects_unknown_padding():
+    with pytest.raises(ValueError, match="padding"):
+        gather_csa2_kv_sc(
+            jnp.zeros((4, 128), jnp.int32),
+            jnp.zeros((4,), jnp.float32),
+            jnp.zeros((1, 512), jnp.int32),
+            deep=True,
+            padding="row0",
+        )
 
 
 def test_gather_chunk_size_splits_only_measured_small_buckets():

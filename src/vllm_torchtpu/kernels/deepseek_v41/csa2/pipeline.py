@@ -34,6 +34,7 @@ def csa2_gather_chunk_size(num_tokens: int) -> int:
         "scale",
         "compress_ratio",
         "deep_gather",
+        "gather_padding",
     ),
 )
 def csa2_pipeline(
@@ -55,6 +56,7 @@ def csa2_pipeline(
     scale: float,
     compress_ratio: int,
     deep_gather: bool = False,
+    gather_padding: str = "shared",
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Return attention and contiguous gathered KV for subsequent layer reuse.
 
@@ -71,7 +73,8 @@ def csa2_pipeline(
     bounds retain their absolute positions, including future draft tokens.
 
     ``deep_gather`` selects the three-slot SparseCore gather
-    (``gather_csa2_kv_sc(deep=True)``).
+    (``gather_csa2_kv_sc(deep=True)``) and ``gather_padding`` its source of
+    zeros for negative record IDs.
     """
     if chunk_size < 1 or not q.shape[0]:
         raise ValueError("CSA2 pipeline requires nonempty queries and positive chunks")
@@ -84,10 +87,11 @@ def csa2_pipeline(
         compress_ratio=compress_ratio,
         bq=bq,
     )
+    gather = functools.partial(
+        gather_csa2_kv_sc, words, scales, deep=deep_gather, padding=gather_padding
+    )
     if q.shape[0] <= chunk_size:
-        gathered_words, gathered_scales = gather_csa2_kv_sc(
-            words, scales, records, deep=deep_gather
-        )
+        gathered_words, gathered_scales = gather(records)
         output = csa2(
             q,
             gathered_words,
@@ -109,7 +113,7 @@ def csa2_pipeline(
     # the two in-place writers stay disjoint.
     owners = None
     previous = None
-    current = gather_csa2_kv_sc(words, scales, records[:chunk_size], deep=deep_gather)
+    current = gather(records[:chunk_size])
     for offset in range(0, q.shape[0], chunk_size):
         end = min(offset + chunk_size, q.shape[0])
         next_ids = records[end : end + chunk_size]
@@ -125,11 +129,7 @@ def csa2_pipeline(
             # Gating on q too keeps gather 1 beside attention 0: issued any
             # earlier, it competes with the Q projection for HBM bandwidth.
             current, next_ids, q = jax.lax.optimization_barrier((current, next_ids, q))
-        following = (
-            gather_csa2_kv_sc(words, scales, next_ids, deep=deep_gather)
-            if end < q.shape[0]
-            else None
-        )
+        following = gather(next_ids) if end < q.shape[0] else None
         chunk_words, chunk_scales = current
         scale_chunks.append(chunk_scales)
         destinations = (

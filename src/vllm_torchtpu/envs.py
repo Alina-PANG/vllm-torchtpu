@@ -27,6 +27,10 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER: bool = True
     TPU_DEEPSEEK_V41_QB_ROPE_EXACT_ROWS: bool = True
     TPU_DEEPSEEK_V41_CSA2_DEEP_GATHER: bool = True
+    TPU_DEEPSEEK_V41_CSA2_GATHER_PADDING: str = "shared"
+    TPU_DEEPSEEK_V41_INDEXER_EVEN_PREFILL_TILES: bool = False
+    TPU_DEEPSEEK_V41_INDEXER_MASK_UNSEEN_PAGES: bool = False
+    TPU_DEEPSEEK_V41_STREAMING_TOPK_NEAREST_CONFIG: bool = False
     TPU_K3_SP_PREFILL: bool = False
     TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD: bool = True
     TPU_ONEHOT_TABLE_LOOKUP: bool = True
@@ -546,6 +550,44 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (csa2/cache.py). Gathered rows are unchanged.
     "TPU_DEEPSEEK_V41_CSA2_DEEP_GATHER": env_bool(
         "TPU_DEEPSEEK_V41_CSA2_DEEP_GATHER", default=True
+    ),
+    # CSA2 deep SparseCore gather: where rows with a negative record ID
+    # (padding rows, and the tail of rows holding fewer than 512 records)
+    # get their zeros. "shared": every such row copies row 0 of one small
+    # zero buffer. "spread": each lane, subcore, stream and slot copies its
+    # own zero row. "skip": a 16-row stream without a valid record issues
+    # no gather and is written from a resident zero buffer. Gathered rows
+    # are unchanged (csa2/cache.py). Ignored without the deep gather.
+    "TPU_DEEPSEEK_V41_CSA2_GATHER_PADDING": env_with_choices(
+        "TPU_DEEPSEEK_V41_CSA2_GATHER_PADDING",
+        "shared",
+        ["shared", "spread", "skip"],
+    ),
+    # Packed FP8 prefill indexer: when the score-tile budget does not divide
+    # the step (2,048 rows against a 320-row budget at a 419,328-key
+    # capacity), use the tallest tile that does. The step then keeps the
+    # overlapped score/selection pipeline instead of the serial path with a
+    # padded last tile. Regroups the scorer's queries, so scores may round
+    # differently. Default off until measured.
+    "TPU_DEEPSEEK_V41_INDEXER_EVEN_PREFILL_TILES": env_bool(
+        "TPU_DEEPSEEK_V41_INDEXER_EVEN_PREFILL_TILES", default=False
+    ),
+    # Packed FP8 dense indexer scorer: treat the block-table entries past
+    # each request's longest context as invalid pages. Those entries hold the
+    # null block, and reading it for every page past the context serializes
+    # the loads of a partially filled key tile. Scores are unchanged
+    # (bit-exact): the keys of those pages are masked either way. Default off
+    # until measured.
+    "TPU_DEEPSEEK_V41_INDEXER_MASK_UNSEEN_PAGES": env_bool(
+        "TPU_DEEPSEEK_V41_INDEXER_MASK_UNSEEN_PAGES", default=False
+    ),
+    # SparseCore streaming top-k: a score width without a measured config
+    # (index_selection/tuned_block_sizes.py) uses the config of the nearest
+    # measured width instead of the untuned default. Same selected scores;
+    # with unordered output the winners among equal scores may differ.
+    # Default off until measured.
+    "TPU_DEEPSEEK_V41_STREAMING_TOPK_NEAREST_CONFIG": env_bool(
+        "TPU_DEEPSEEK_V41_STREAMING_TOPK_NEAREST_CONFIG", default=False
     ),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),

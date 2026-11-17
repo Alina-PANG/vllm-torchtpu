@@ -13,6 +13,8 @@ import jax
 import jax.numpy as jnp
 
 MIN_KV_AMAX = 1e-4
+# Sources of the zeros that the deep gather writes for negative record IDs.
+_DEEP_PADDING = ("shared", "spread", "skip")
 
 
 @jax.jit
@@ -36,19 +38,24 @@ def encode_csa2_kv(latent: jax.Array) -> tuple[jax.Array, jax.Array]:
     return jax.lax.bitcast_convert_type(words, jnp.int32), scales
 
 
-@functools.partial(jax.jit, static_argnames=("deep",))
+@functools.partial(jax.jit, static_argnames=("deep", "padding"))
 def gather_csa2_kv_sc(
     words: jax.Array | tuple[jax.Array, jax.Array],
     scales: jax.Array | tuple[jax.Array, jax.Array],
     records: jax.Array,
     *,
     deep: bool = False,
+    padding: str = "shared",
 ) -> tuple[jax.Array, jax.Array]:
     """SparseCore producer; invalid rows are zeroed once before any reuse.
 
     ``deep`` keeps three staging slots in flight and zeroes invalid rows with
     a masked DMA instead of clearing every slot with vector stores.
+    ``padding`` picks where the deep gather takes those zeros from (see
+    ``_gather_sc_banked_deep``); the gathered rows are the same for each.
     """
+    if padding not in _DEEP_PADDING:
+        raise ValueError(f"CSA2 gather padding must be one of {_DEEP_PADDING}")
     banks = words if isinstance(words, tuple) else (words,)
     scale_banks = scales if isinstance(scales, tuple) else (scales,)
     if len(banks) not in (1, 2) or len(banks) != len(scale_banks):
@@ -69,7 +76,7 @@ def gather_csa2_kv_sc(
             records.shape, jnp.float32
         )
     if deep:
-        return _gather_sc_banked_deep(banks, scale_banks, records)
+        return _gather_sc_banked_deep(banks, scale_banks, records, padding)
     return _gather_sc_banked(banks, scale_banks, records)
 
 
@@ -213,7 +220,7 @@ def _gather_sc_banked(words, scales, records):
     )
 
 
-def _gather_sc_banked_deep(words, scales, records):
+def _gather_sc_banked_deep(words, scales, records, padding="shared"):
     """``_gather_sc_banked`` with three slots and DMA-zeroed invalid rows.
 
     The gather for step i + 2 is issued while step i's rows are written, so
@@ -222,6 +229,15 @@ def _gather_sc_banked_deep(words, scales, records):
     ids, so every staged row has exactly one writer and no slot is cleared.
     Copies of one slot and stream share a semaphore; with one semaphore per
     source, kind and slot, three- and four-slot versions hung on v7x.
+
+    ``padding`` selects the zero rows that negative ids copy:
+
+    - "shared": row 0 of one small buffer, for every lane of every subcore.
+    - "spread": a row of its own per lane, subcore, stream and slot, so that
+      no two copies in flight read the same row.
+    - "skip": a stream without a valid id issues no gather; its output rows
+      are written from a zero buffer resident in each subcore's VMEM. Streams
+      that mix valid and negative ids gather as in "shared".
     """
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import tpu as pltpu
@@ -234,10 +250,18 @@ def _gather_sc_banked_deep(words, scales, records):
     streams, subchunks, slots = (4 if len(words) == 1 else 2), 512 // lanes, 3
     block = cores * lanes * subchunks
     count = records.size
-    padding = -count % block
-    indices = jnp.pad(records.reshape(-1), (0, padding), constant_values=-1)
-    zero_words = jnp.zeros((8, 128), jnp.int32)
-    zero_scales = jnp.zeros((8,), jnp.float32)
+    padded = -count % block
+    indices = jnp.pad(records.reshape(-1), (0, padded), constant_values=-1)
+    spread, skip = padding == "spread", padding == "skip"
+    zero_rows = slots * streams * cores * lanes if spread else 8
+    zero_words = jnp.zeros((zero_rows, 128), jnp.int32)
+    zero_scales = jnp.zeros((zero_rows,), jnp.float32)
+    blocked = (indices,)
+    if skip:
+        # One flag per stream, repeated over its lanes: the kernel loads it
+        # like the ids and reads lane 0.
+        live = (indices.reshape(-1, lanes) >= 0).any(axis=1)
+        blocked += (jnp.repeat(live.astype(jnp.int32), lanes),)
     mesh = plsc.VectorSubcoreMesh(
         num_cores=info.num_cores,
         num_subcores=info.num_subcores,
@@ -245,77 +269,104 @@ def _gather_sc_banked_deep(words, scales, records):
         subcore_axis_name="subcore",
     )
 
-    def kernel(
-        word_refs,
-        scale_refs,
-        zero_word_ref,
-        zero_scale_ref,
-        ids_ref,
-        word_out,
-        scale_out,
-        word_buf,
-        scale_buf,
-        read_sem,
-        write_sem,
-    ):
+    def kernel(word_refs, scale_refs, zero_word_ref, zero_scale_ref, *refs):
+        blocked_refs, refs = refs[: len(blocked)], refs[len(blocked) :]
+        word_out, scale_out, word_buf, scale_buf, read_sem, write_sem, *resident = refs
         core = jax.lax.axis_index((mesh.core_axis_name, mesh.subcore_axis_name))
         split = word_refs[0].shape[0]
         steps = subchunks // streams
+        if skip:
+            resident[0][...] = jnp.zeros((lanes, 128), jnp.int32)
+            resident[1][...] = jnp.zeros((lanes,), jnp.float32)
 
-        def outer(ids):
+        def outer(ids, *flags):
             base = (pl.program_id(0) * cores + core) * subchunks * lanes
+
+            def live(step, stream):
+                flag = flags[0][pl.ds((step * streams + stream) * lanes, lanes)]
+                return flag[0] != 0
 
             def gather(step, wait=False):
                 slot = step % slots
                 for stream in range(streams):
-                    selected = ids[pl.ds((step * streams + stream) * lanes, lanes)]
-                    targets = []
-                    for bank in range(len(words)):
-                        own = (selected >= 0) & (
-                            selected >= split if bank else selected < split
-                        )
-                        local = selected - split if bank else selected
+
+                    def copies(stream=stream):
+                        selected = ids[pl.ds((step * streams + stream) * lanes, lanes)]
+                        targets = []
+                        for bank in range(len(words)):
+                            own = (selected >= 0) & (
+                                selected >= split if bank else selected < split
+                            )
+                            local = selected - split if bank else selected
+                            targets.append(
+                                (
+                                    word_refs[bank],
+                                    scale_refs[bank],
+                                    jnp.where(own, local, -1),
+                                )
+                            )
+                        zero = 0
+                        if spread:
+                            zero = ((slot * streams + stream) * cores + core) * lanes
+                            zero = zero + jnp.arange(lanes, dtype=jnp.int32)
                         targets.append(
                             (
-                                word_refs[bank],
-                                scale_refs[bank],
-                                jnp.where(own, local, -1),
+                                zero_word_ref,
+                                zero_scale_ref,
+                                jnp.where(selected < 0, zero, -1),
                             )
                         )
-                    targets.append(
-                        (zero_word_ref, zero_scale_ref, jnp.where(selected < 0, 0, -1))
-                    )
-                    for word_src, scale_src, rows in targets:
-                        indexed = plsc.Indices(rows, ignored_value=-1)
-                        for kind, (src, dst) in enumerate(
-                            ((word_src, word_buf), (scale_src, scale_buf))
-                        ):
+                        for word_src, scale_src, rows in targets:
+                            indexed = plsc.Indices(rows, ignored_value=-1)
+                            for src, dst in (
+                                (word_src, word_buf),
+                                (scale_src, scale_buf),
+                            ):
+                                copy = pltpu.make_async_copy(
+                                    src.at[indexed],
+                                    dst.at[slot, stream],
+                                    read_sem.at[slot, stream],
+                                )
+                                if wait:
+                                    copy.wait()
+                                else:
+                                    copy.start()
+
+                    if skip:
+                        pl.when(live(step, stream))(copies)
+                    else:
+                        copies()
+
+            def write(step, wait=False):
+                slot = step % slots
+                for stream in range(streams):
+                    offset = base + (step * streams + stream) * lanes
+
+                    def copies(staged, stream=stream, offset=offset):
+                        sources = (
+                            (word_buf.at[slot, stream], scale_buf.at[slot, stream])
+                            if staged
+                            else resident
+                        )
+                        for src, dst in zip(sources, (word_out, scale_out)):
                             copy = pltpu.make_async_copy(
-                                src.at[indexed],
-                                dst.at[slot, stream],
-                                read_sem.at[slot, stream],
+                                src,
+                                dst.at[pl.ds(offset, lanes)],
+                                write_sem.at[slot, stream],
                             )
                             if wait:
                                 copy.wait()
                             else:
                                 copy.start()
 
-            def write(step, wait=False):
-                slot = step % slots
-                for stream in range(streams):
-                    offset = base + (step * streams + stream) * lanes
-                    for kind, (src, dst) in enumerate(
-                        ((word_buf, word_out), (scale_buf, scale_out))
-                    ):
-                        copy = pltpu.make_async_copy(
-                            src.at[slot, stream],
-                            dst.at[pl.ds(offset, lanes)],
-                            write_sem.at[slot, stream],
+                    if skip:
+                        staged = live(step, stream)
+                        pl.when(staged)(functools.partial(copies, True))
+                        pl.when(jnp.logical_not(staged))(
+                            functools.partial(copies, False)
                         )
-                        if wait:
-                            copy.wait()
-                        else:
-                            copy.start()
+                    else:
+                        copies(True)
 
             gather(jnp.int32(0))
             gather(jnp.int32(1))
@@ -336,26 +387,33 @@ def _gather_sc_banked_deep(words, scales, records):
 
         pltpu.emit_pipeline(
             outer,
-            grid=((count + padding) // block,),
-            in_specs=(
-                pl.BlockSpec((lanes * subchunks,), lambda b: (b * cores + core,)),
+            grid=((count + padded) // block,),
+            in_specs=tuple(
+                pl.BlockSpec((lanes * subchunks,), lambda b: (b * cores + core,))
+                for _ in blocked
             ),
-        )(ids_ref)
+        )(*blocked_refs)
 
+    scratch_types = [
+        pltpu.VMEM((slots, streams, lanes, 128), jnp.int32),
+        pltpu.VMEM((slots, streams, lanes), jnp.float32),
+        pltpu.SemaphoreType.DMA((slots, streams)),
+        pltpu.SemaphoreType.DMA((slots, streams)),
+    ]
+    if skip:
+        scratch_types += [
+            pltpu.VMEM((lanes, 128), jnp.int32),
+            pltpu.VMEM((lanes,), jnp.float32),
+        ]
     out, scale_out = cast(
         tuple[jax.Array, jax.Array],
         pl.kernel(
             kernel,
             out_type=(
-                jax.ShapeDtypeStruct((count + padding, 128), jnp.int32),
-                jax.ShapeDtypeStruct((count + padding,), jnp.float32),
+                jax.ShapeDtypeStruct((count + padded, 128), jnp.int32),
+                jax.ShapeDtypeStruct((count + padded,), jnp.float32),
             ),
-            scratch_types=(
-                pltpu.VMEM((slots, streams, lanes, 128), jnp.int32),
-                pltpu.VMEM((slots, streams, lanes), jnp.float32),
-                pltpu.SemaphoreType.DMA((slots, streams)),
-                pltpu.SemaphoreType.DMA((slots, streams)),
-            ),
+            scratch_types=tuple(scratch_types),
             compiler_params=pltpu.CompilerParams(
                 use_tc_tiling_on_sc=False,
                 needs_layout_passes=True,
@@ -369,7 +427,7 @@ def _gather_sc_banked_deep(words, scales, records):
             scales,
             zero_words,
             zero_scales,
-            indices,
+            *blocked,
         ),
     )
     return out[:count].reshape(*records.shape, 128), scale_out[:count].reshape(

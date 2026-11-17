@@ -38,6 +38,24 @@ def _encode_page_table(page_ids, layout, first_bank_rows):
     return (local_rows << 2) | (valid.astype(jnp.int32) << 1) | bank
 
 
+def _mask_unseen_pages(page_ids, context_lens, query_start_loc, page_size):
+    """Mark the pages past every query's context of each request as invalid.
+
+    A block table holds the null block in its unallocated entries. Read as a
+    valid page, the null block repeats one page over the rest of a partially
+    filled tile, which serializes that tile's loads. Marked invalid, those
+    reads are spread over distinct pages (`_encode_page_table`). The scores
+    past each context are -inf either way.
+    """
+    rows = jnp.arange(context_lens.shape[0], dtype=jnp.int32)
+    starts = query_start_loc.astype(jnp.int32)
+    mine = (rows >= starts[:-1, None]) & (rows < starts[1:, None])
+    longest = jnp.where(mine, context_lens.astype(jnp.int32), 0).max(axis=1)
+    live = (longest + page_size - 1) // page_size
+    seen = jnp.arange(page_ids.shape[1], dtype=jnp.int32) < live[:, None]
+    return jnp.where(seen, page_ids, -1)
+
+
 def _pick(future, ends, values):
     """values[g] belongs to the tile group ending at ends[g]; the last is open."""
     picked = values[-1]
@@ -479,6 +497,10 @@ def fp8_paged_mqa_logits(
     page_ids = block_table[:, :page_count]
     pad = ((0, 0), (0, page_count - page_ids.shape[1]))
     page_ids = jnp.pad(page_ids, pad, constant_values=-1)
+    if envs.TPU_DEEPSEEK_V41_INDEXER_MASK_UNSEEN_PAGES:
+        page_ids = _mask_unseen_pages(
+            page_ids, context_lens, query_start_loc, layout.page_size
+        )
     table = _encode_page_table(page_ids, layout, banks[0].shape[0])
     page_count = pl.cdiv(tile_pages, info.num_lanes) * info.num_lanes
     table = table.reshape(page_ids.shape[0], -1, tile_pages)

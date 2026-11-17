@@ -73,6 +73,28 @@ def indexer_query_rows(tokens: int, query_tile: int) -> int:
     return chunk if chunk % query_tile == 0 else tokens
 
 
+def prefill_score_rows(tokens: int, budget: int) -> int:
+    """Tallest score tile within ``budget`` rows that splits ``tokens`` evenly.
+
+    The overlapped prefill pipeline scores whole tiles. A budget that does not
+    divide the step otherwise falls back to the serial path with a padded last
+    tile: 2,048 rows against the 320-row budget of a 419,328-key capacity run
+    as seven 320-row tiles, one after another. Candidates stay a multiple of
+    the SparseCore wave and above half the budget; without such a divisor the
+    budget is returned unchanged.
+    """
+    if budget < 1 or tokens % budget == 0 or jax.default_backend() != "tpu":
+        return budget
+    sc = pltpu.get_tpu_info().sparse_core
+    if sc is None:
+        return budget
+    wave = sc.num_cores * sc.num_subcores
+    for rows in range(budget // wave * wave, budget // 2, -wave):
+        if tokens % rows == 0:
+            return rows
+    return budget
+
+
 def topk_reconstruction_threshold(k: int) -> int:
     """Bound the live candidate excess proportionally to the output width."""
     return min(8192, 4 * k)

@@ -10,6 +10,7 @@ import jax.numpy as jnp
 import torch
 from jax.experimental import xla_metadata
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v41 import (
     indexer,
 )
@@ -39,6 +40,7 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.tuned import (
     PACKED_FP8_MQA_CONFIG,
     indexer_query_rows,
     paged_mqa_key_tile,
+    prefill_score_rows,
     topk_reconstruction_threshold,
 )
 
@@ -769,6 +771,10 @@ def select_fp8_indexer_jax(
         PACKED_FP8_MQA_CONFIG.query_tile,
         _INDEX_UNTILED_SCORE_ELEMENTS // max(capacity, 1),
     )
+    if envs.TPU_DEEPSEEK_V41_INDEXER_EVEN_PREFILL_TILES:
+        # A capacity that is not a power of two leaves a budget that need not
+        # divide the step; keep such steps on the overlapped pipeline.
+        chunk = prefill_score_rows(q.shape[0], chunk)
     if (
         width >= score_width
         or chunk >= q.shape[0]

@@ -10,6 +10,13 @@ import pytest
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.streaming_topk import (
     streaming_topk,
 )
+from vllm_torchtpu.kernels.deepseek_v41.index_selection.tuned_block_sizes import (
+    STREAMING_TOPK_CONFIG,
+    StreamingTopKConfig,
+    streaming_topk_config,
+)
+
+NEAREST_CONFIG = "TPU_DEEPSEEK_V41_STREAMING_TOPK_NEAREST_CONFIG"
 
 
 @pytest.mark.parametrize("block,threshold", [(8192, 8192), (16384, 32768)])
@@ -68,3 +75,56 @@ def test_streaming_topk_contract(block, threshold, width, distribution):
         order = np.lexsort((eligible, ~keys))[:512]
         np.testing.assert_array_equal(np.sort(ids), np.sort(eligible[order]))
         assert np.unique(ids).size == ids.size
+
+
+@pytest.mark.parametrize(
+    ("width", "nearest", "measured"),
+    [(98816, False, 98816), (59904, False, None), (59904, True, 49408)]
+    + [(419328, True, 98816)],
+    ids=["measured", "unmeasured_default", "nearest_below", "nearest_above"],
+)
+def test_streaming_topk_config_of_unmeasured_widths(
+    monkeypatch, width, nearest, measured
+):
+    """Only the flag lets a width without an entry borrow a measured config."""
+    monkeypatch.setenv(NEAREST_CONFIG, "1" if nearest else "0")
+    expected = (
+        StreamingTopKConfig()
+        if measured is None
+        else STREAMING_TOPK_CONFIG[(7, measured, 512)]
+    )
+    assert streaming_topk_config(7, width, 512) == expected
+
+
+@pytest.mark.parametrize(
+    "nearest", [False, True], ids=["default_config", "nearest_config"]
+)
+def test_unordered_topk_scores_at_an_unmeasured_width(monkeypatch, nearest):
+    """59,904 keys, one key tile of an 835,584-token context: same top scores."""
+    if jax.default_backend() != "tpu":
+        pytest.skip("SparseCore selection requires TPU")
+    monkeypatch.setenv(NEAREST_CONFIG, "1" if nearest else "0")
+    width, rows = 59904, 32
+    rng = np.random.default_rng(23)
+    # Indexer scores are sums of ReLU outputs: non-negative, with exact zeros.
+    scores = np.maximum(rng.normal(size=(rows, width)), 0).astype(np.float32)
+    lengths = np.resize(np.array([513, 4096, 20000, 40000, width], np.int32), rows)
+    # A fresh trace reads the flag; the public entry point caches its own.
+    select = jax.jit(
+        lambda scores, lengths: streaming_topk.__wrapped__(
+            scores,
+            valid_lengths=lengths,
+            k=512,
+            exclude_neg_inf=True,
+            reconstruct_threshold=2048,
+            unordered=True,
+        )
+    )
+    actual = np.asarray(select(jnp.asarray(scores), jnp.asarray(lengths)))
+    for row, length in enumerate(lengths):
+        ids = actual[row][actual[row] >= 0]
+        assert np.unique(ids).size == ids.size == 512
+        assert (ids < length).all()
+        np.testing.assert_array_equal(
+            np.sort(scores[row, ids]), np.sort(scores[row, :length])[-512:]
+        )
